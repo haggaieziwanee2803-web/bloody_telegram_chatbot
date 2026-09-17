@@ -27,7 +27,7 @@ LAGOS_TZ = ZoneInfo("Africa/Lagos")
 
 GREETING_CHAT_IDS = [
     "@justforfun3668",
-    "@bloodyhazybotgroup",
+    
 ]
 
 MORNING_MESSAGES = [

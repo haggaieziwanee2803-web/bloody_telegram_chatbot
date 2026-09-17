@@ -4,11 +4,10 @@ Adds security, moderation, group utilities and games without replacing
 the existing AI / voice / music / XP systems in handlers_admin.py.
 """
 
-import os
+import logging
 import re
 import time
 import random
-import json
 from datetime import datetime
 
 from telegram import Update, ChatPermissions
@@ -17,23 +16,24 @@ from telegram.ext import ContextTypes
 
 import database as db
 
+logger = logging.getLogger(__name__)
+
 
 # ============================================================
 # CORE HELPERS
 # ============================================================
 
 def _load():
-    if not os.path.exists(db.DB_FILE):
-        return {
-            "warnings": {}, "settings": {}, "users": {},
-            "active_recognition": {}, "ai_memory": {}
-        }
-
-    try:
-        with open(db.DB_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        data = {}
+    # IMPORTANT: this now goes through database.py's own load_db(),
+    # which keeps an in-memory cached copy of bot_data.json protected
+    # by a lock. The old version of this function read the file
+    # straight off disk, bypassing that cache entirely — which meant
+    # a save from database.py (which happens constantly, e.g. every
+    # time someone earns XP) could silently overwrite whatever this
+    # file had just written, and vice versa. Routing through db.load_db()
+    # / db.save_db() below means both files are working with the same
+    # single source of truth, so changes never clobber each other.
+    data = db.load_db()
 
     data.setdefault("warnings", {})
     data.setdefault("settings", {})
@@ -44,8 +44,7 @@ def _load():
 
 
 def _save(data):
-    with open(db.DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4)
+    db.save_db(data)
 
 
 def _settings(chat_id):
@@ -63,8 +62,8 @@ def _settings(chat_id):
         "antidemote": False,
         "welcome": False,
         "goodbye": False,
-        "welcome_text": "👋 Welcome {name} to {chat}!",
-        "goodbye_text": "👋 {name} has left the group.",
+        "welcome_text": "👋 Welcome {name} to {chat}! We're pleased to have you here 🎉",
+        "goodbye_text": "👋 {name} has left {chat}. We'll miss you!",
         "rules": "📜 No rules have been configured yet.",
         "locked": False,
         "slowmode": 0,
@@ -234,8 +233,30 @@ async def antidemote_command(update, context):
     await _toggle(update, context, "antidemote", "ANTI-DEMOTE")
 
 
+# ============================================================
+# LOCK / UNLOCK — now actually enforced (previously just set a
+# flag and didn't stop anyone from sending messages)
+# ============================================================
+
 async def lock_command(update, context):
     if not await admin_only(update, context):
+        return
+
+    if not await bot_has_permission(update, context, "can_restrict_members"):
+        await update.effective_message.reply_text(
+            "⚠️ I need the 'restrict members' permission first."
+        )
+        return
+
+    try:
+        await context.bot.set_chat_permissions(
+            update.effective_chat.id,
+            ChatPermissions(can_send_messages=False),
+        )
+    except Exception as error:
+        await update.effective_message.reply_text(
+            f"❌ Couldn't lock the group: {error}"
+        )
         return
 
     data = _load()
@@ -245,13 +266,42 @@ async def lock_command(update, context):
     _save(data)
 
     await update.effective_message.reply_text(
-        "🔒 **GROUP LOCKED**\n\nBLOODY moderation lock is active.",
+        "🔒 **GROUP LOCKED**\n\nOnly admins can send messages now.",
         parse_mode="Markdown",
     )
 
 
 async def unlock_command(update, context):
     if not await admin_only(update, context):
+        return
+
+    if not await bot_has_permission(update, context, "can_restrict_members"):
+        await update.effective_message.reply_text(
+            "⚠️ I need the 'restrict members' permission first."
+        )
+        return
+
+    try:
+        await context.bot.set_chat_permissions(
+            update.effective_chat.id,
+            ChatPermissions(
+                can_send_messages=True,
+                can_send_audios=True,
+                can_send_documents=True,
+                can_send_photos=True,
+                can_send_videos=True,
+                can_send_video_notes=True,
+                can_send_voice_notes=True,
+                can_send_polls=True,
+                can_send_other_messages=True,
+                can_add_web_page_previews=True,
+                can_invite_users=True,
+            ),
+        )
+    except Exception as error:
+        await update.effective_message.reply_text(
+            f"❌ Couldn't unlock the group: {error}"
+        )
         return
 
     data = _load()
@@ -261,7 +311,7 @@ async def unlock_command(update, context):
     _save(data)
 
     await update.effective_message.reply_text(
-        "🔓 **GROUP UNLOCKED**\n\nNormal member messaging restored.",
+        "🔓 **GROUP UNLOCKED**\n\nEveryone can send messages again.",
         parse_mode="Markdown",
     )
 
@@ -498,16 +548,116 @@ async def info_command(update, context):
     )
 
 
+# ============================================================
+# TAGALL — real version.
+#
+# Mentions every user the bot has actually seen post in this group
+# (tracked in db.group_stats[chat_id]["members_seen"]). Sent in
+# batches so it doesn't hit Telegram's message-length limit.
+#
+# LIMIT (Telegram platform limit, not something code can get around):
+# the Bot API does NOT expose a full member list for privacy reasons.
+# This can only mention people who've sent at least one message since
+# the bot joined — there's no way to tag someone who's never spoken.
+# ============================================================
+
 async def tagall_command(update, context):
     if not await admin_only(update, context):
         return
 
-    await update.effective_message.reply_text(
-        "📢 **TAGALL MODE**\n\n"
-        "Telegram does not expose a safe one-call API for every group member. "
-        "Use this command for announcement mode instead of mass-spamming mentions.",
-        parse_mode="Markdown",
+    chat = update.effective_chat
+    stats = db.get_group_stats(chat.id)
+    member_ids = stats.get("members_seen", [])
+
+    if not member_ids:
+        await update.effective_message.reply_text(
+            "⚠️ I don't have any known members yet for this group. "
+            "I can only tag people who've sent at least one message "
+            "since I joined — Telegram doesn't let bots see the full "
+            "member list."
+        )
+        return
+
+    custom_text = (
+        " ".join(context.args).strip() if context.args else "📢 Attention everyone!"
     )
+
+    mentions = []
+
+    for uid in member_ids:
+        user_stats = db.get_user_stats(uid)
+        name = user_stats["name"] if user_stats else "Member"
+        mentions.append(f"[{name}](tg://user?id={uid})")
+
+    batch_size = 10
+
+    for i in range(0, len(mentions), batch_size):
+        chunk = mentions[i:i + batch_size]
+        text = f"{custom_text}\n\n" + " ".join(chunk) if i == 0 else " ".join(chunk)
+
+        try:
+            await context.bot.send_message(
+                chat_id=chat.id, text=text, parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+
+
+# ============================================================
+# PIN / UNPIN
+# ============================================================
+
+async def pin_command(update, context):
+    if not await admin_only(update, context):
+        return
+
+    message = update.effective_message
+    target_message = message.reply_to_message
+
+    if not target_message:
+        await message.reply_text(
+            "📌 Reply to the message you want to pin with `/pin`.",
+            parse_mode="Markdown",
+        )
+        return
+
+    if not await bot_has_permission(update, context, "can_pin_messages"):
+        await message.reply_text("⚠️ I need the 'pin messages' permission first.")
+        return
+
+    try:
+        await context.bot.pin_chat_message(
+            chat_id=update.effective_chat.id,
+            message_id=target_message.message_id,
+        )
+        await message.reply_text("📌 Message pinned.")
+    except Exception as error:
+        await message.reply_text(f"❌ Couldn't pin that message: {error}")
+
+
+async def unpin_command(update, context):
+    if not await admin_only(update, context):
+        return
+
+    message = update.effective_message
+
+    if not await bot_has_permission(update, context, "can_pin_messages"):
+        await message.reply_text("⚠️ I need the 'pin messages' permission first.")
+        return
+
+    try:
+        if message.reply_to_message:
+            await context.bot.unpin_chat_message(
+                chat_id=update.effective_chat.id,
+                message_id=message.reply_to_message.message_id,
+            )
+        else:
+            # No reply given -> unpins the most recent pinned message.
+            await context.bot.unpin_chat_message(chat_id=update.effective_chat.id)
+
+        await message.reply_text("📌 Message unpinned.")
+    except Exception as error:
+        await message.reply_text(f"❌ Couldn't unpin: {error}")
 
 
 # ============================================================
@@ -798,48 +948,67 @@ async def protection_message_handler(update, context):
             FLOOD_CACHE[key] = []
 
 
+# ============================================================
+# NEW MEMBER HANDLER — now also handles goodbye (originally only
+# handled welcome + antibot, nothing when someone left)
+# ============================================================
+
 async def new_member_handler(update, context):
+    """Fires on the 'so-and-so joined/left the group' SERVICE MESSAGES
+    (message.new_chat_members / message.left_chat_member), not the
+    chat_member update type.
+
+    WHY THE SWITCH: chat_member updates about OTHER users (as opposed
+    to the bot's own membership) are only reliably delivered to bots
+    that are full administrators in the chat, and can be flaky even
+    then. Service messages, on the other hand, are delivered to every
+    bot in the group regardless of admin status — this is the same
+    mechanism nearly every welcome/goodbye bot on Telegram actually
+    uses, and it's why /welcome was showing as "on" but silently
+    doing nothing when someone actually joined.
+    """
+
+    message = update.effective_message
     chat = update.effective_chat
+
+    if not message or not chat:
+        return
+
     s = _settings(chat.id)
 
-    if not update.chat_member:
-        return
+    # --- Someone joined (can be several people added at once) ---
+    if message.new_chat_members:
+        for user in message.new_chat_members:
+            # Anti-bot: ban bots on join if the setting is on.
+            if s.get("antibot") and user.is_bot:
+                if await bot_has_permission(update, context, "can_restrict_members"):
+                    try:
+                        await context.bot.ban_chat_member(chat.id, user.id)
+                    except Exception:
+                        pass
+                continue
 
-    old_status = update.chat_member.old_chat_member.status
-    new_status = update.chat_member.new_chat_member.status
-    user = update.chat_member.new_chat_member.user
+            if s.get("welcome"):
+                text = s["welcome_text"].format(
+                    name=user.full_name,
+                    chat=chat.title or "this group",
+                )
+                try:
+                    await context.bot.send_message(chat.id, text)
+                except Exception as error:
+                    logger.warning(f"Welcome message error: {error}")
 
-    # Anti-bot
-    if (
-        s.get("antibot")
-        and new_status in (
-            ChatMemberStatus.MEMBER,
-            ChatMemberStatus.RESTRICTED,
-        )
-        and user.is_bot
-    ):
-        if await bot_has_permission(update, context, "can_restrict_members"):
-            try:
-                await context.bot.ban_chat_member(chat.id, user.id)
-            except Exception:
-                pass
-        return
-
-    # Welcome
-    joined = old_status in (
-        ChatMemberStatus.LEFT,
-        ChatMemberStatus.KICKED,
-    ) and new_status in (
-        ChatMemberStatus.MEMBER,
-        ChatMemberStatus.RESTRICTED,
-    )
-
-    if joined and s.get("welcome"):
-        text = s["welcome_text"].format(
+    # --- Someone left / was removed ---
+    if message.left_chat_member and s.get("goodbye"):
+        user = message.left_chat_member
+        text = s["goodbye_text"].format(
             name=user.full_name,
             chat=chat.title or "this group",
         )
-        await context.bot.send_message(chat.id, f"👋 {text}")
+        try:
+            await context.bot.send_message(chat.id, text)
+        except Exception as error:
+            logger.warning(f"Goodbye message error: {error}")
 
 
 # ============================================================
@@ -882,6 +1051,7 @@ async def ultimate_menu_command(update, context):
 │ /givexp /poll
 │ /announce /admins
 │ /tagall /id /info
+│ /pin /unpin
 ╰━━━━━━━━━━━━━━━━━━╯
 
 ╭━━━ 👥 GROUP SYSTEM ━━━╮

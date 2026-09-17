@@ -22,6 +22,7 @@ import handlers_admin as h
 import handlers_media as media
 import handlers_forcesub as forcesub
 import handlers_greetings as greetings
+import upgraded_features as uf
 from config import BOT_TOKEN
 
 
@@ -164,6 +165,23 @@ def main():
         group=3
     )
 
+    # NEW — this is what makes /welcome and /goodbye actually fire.
+    #
+    # Deliberately NOT a ChatMemberHandler: chat_member updates about
+    # OTHER users are only reliably delivered to bots that are full
+    # admins in the chat (and can be flaky even then). The
+    # new_chat_members / left_chat_member SERVICE MESSAGES below are
+    # delivered to every bot regardless of admin status — same
+    # mechanism virtually every welcome/goodbye bot actually uses.
+    app.add_handler(
+        MessageHandler(
+            filters.StatusUpdate.NEW_CHAT_MEMBERS
+            | filters.StatusUpdate.LEFT_CHAT_MEMBER,
+            uf.new_member_handler,
+        ),
+        group=3
+    )
+
     app.add_handler(
         MessageHandler(filters.ALL, greetings.track_group_activity),
         group=2
@@ -227,8 +245,15 @@ def main():
     app.add_handler(CommandHandler("steal", h.steal_command))
     app.add_handler(CommandHandler("duel", h.duel_command))
 
+    # NOTE: upgraded_features.py also defines its own rps/coinflip/
+    # dice/slots_command. They're NOT registered below on purpose —
+    # registering both would make the bot reply twice to the same
+    # command. Your handlers_admin.py versions above (with XP
+    # betting) are the ones actually wired up; the upgraded_features
+    # ones are unused leftover code, safe to ignore or delete later.
+
     # --------------------------------------------------------
-    # ADMIN
+    # ADMIN (original)
     # --------------------------------------------------------
     app.add_handler(CommandHandler("badge", h.badge_command))
     app.add_handler(CommandHandler("promote", h.promote_command))
@@ -248,6 +273,71 @@ def main():
     # Reply to any message with /broadcast to copy it into every
     # group the bot is in, or use /broadcast <text> directly.
     app.add_handler(CommandHandler("broadcast", h.broadcast_command))
+
+    # --------------------------------------------------------
+    # UPGRADED FEATURES (upgraded_features.py) — NEW
+    #
+    # These functions already existed in your upgraded_features.py
+    # file but were never registered here, so none of them actually
+    # worked before. They're wired in now.
+    # --------------------------------------------------------
+
+    # Security / anti-abuse toggles
+    app.add_handler(CommandHandler("antilink", uf.antilink_command))
+    app.add_handler(CommandHandler("antiflood", uf.antiflood_command))
+    app.add_handler(CommandHandler("antiraid", uf.antiraid_command))
+    app.add_handler(CommandHandler("antibot", uf.antibot_command))
+    app.add_handler(CommandHandler("antipromote", uf.antipromote_command))
+    app.add_handler(CommandHandler("antidemote", uf.antidemote_command))
+
+    # Lock / unlock / purge / slowmode
+    app.add_handler(CommandHandler("lock", uf.lock_command))
+    app.add_handler(CommandHandler("unlock", uf.unlock_command))
+    app.add_handler(CommandHandler("purge", uf.purge_command))
+    app.add_handler(CommandHandler("slowmode", uf.slowmode_command))
+
+    # Group info / config
+    app.add_handler(CommandHandler("rules", uf.rules_command))
+    app.add_handler(CommandHandler("setrules", uf.setrules_command))
+    app.add_handler(CommandHandler("welcome", uf.welcome_command))
+    app.add_handler(CommandHandler("setwelcome", uf.setwelcome_command))
+    app.add_handler(CommandHandler("goodbye", uf.goodbye_command))
+    app.add_handler(CommandHandler("setgoodbye", uf.setgoodbye_command))
+    app.add_handler(CommandHandler("admins", uf.admins_command))
+    app.add_handler(CommandHandler("id", uf.id_command))
+    app.add_handler(CommandHandler("info", uf.info_command))
+
+    # Requested this round: real tagall + pin/unpin
+    app.add_handler(CommandHandler("tagall", uf.tagall_command))
+    app.add_handler(CommandHandler("pin", uf.pin_command))
+    app.add_handler(CommandHandler("unpin", uf.unpin_command))
+
+    # Extra admin tools
+    app.add_handler(CommandHandler("unban", uf.unban_command))
+    app.add_handler(CommandHandler("botstatus", uf.botstatus_command))
+    app.add_handler(CommandHandler("settings", uf.settings_command))
+    app.add_handler(CommandHandler("quote", uf.quote_command))
+    app.add_handler(CommandHandler("announce", uf.announce_command))
+    app.add_handler(CommandHandler("wordpuzzle", uf.wordpuzzle_command))
+
+    # Full command reference (separate from your existing /menu)
+    app.add_handler(CommandHandler("commands", uf.ultimate_menu_command))
+
+    # Anti-link / anti-flood auto-moderation — needs to see every
+    # group text message to check it, so it runs as a MessageHandler
+    # rather than a command. group=1 so it runs after the greeting/
+    # activity trackers (group 2) but still before the main AI/grid
+    # text handler further down (default group 0 runs before group 1,
+    # so this deliberately sits at group=1 to run AFTER default-group
+    # handlers have had a chance — deletion still happens either way
+    # since Telegram message deletion doesn't depend on handler order).
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & filters.ChatType.GROUPS & ~filters.COMMAND,
+            uf.protection_message_handler,
+        ),
+        group=1
+    )
 
     # --------------------------------------------------------
     # PASSIVE HANDLERS
