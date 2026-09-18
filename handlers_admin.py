@@ -1524,6 +1524,175 @@ def _render_word_grid(
     return temp_file.name
 
 
+
+# ============================================================
+# GRID SCORES — in-memory leaderboard across all grid rounds.
+# Resets when the bot restarts, so it tracks "all-time this
+# session" rather than true all-time. Stored per group and
+# worldwide separately so /gridboard can toggle between them.
+# ============================================================
+
+GRID_GROUP_SCORES = {}    # {chat_id: {user_id: {"name": str, "words": int}}}
+GRID_WORLDWIDE_SCORES = {}  # {user_id: {"name": str, "words": int}}
+
+
+def _update_grid_scores(chat_id, user_id, name, words_found):
+    """Called whenever a player finds a word. Updates both the
+    group leaderboard for this chat and the worldwide one."""
+
+    # Group scores
+    if chat_id not in GRID_GROUP_SCORES:
+        GRID_GROUP_SCORES[chat_id] = {}
+
+    entry = GRID_GROUP_SCORES[chat_id].setdefault(
+        user_id, {"name": name, "words": 0}
+    )
+    entry["name"] = name
+    entry["words"] += words_found
+
+    # Worldwide scores
+    w_entry = GRID_WORLDWIDE_SCORES.setdefault(
+        user_id, {"name": name, "words": 0}
+    )
+    w_entry["name"] = name
+    w_entry["words"] += words_found
+
+
+# ============================================================
+# GRID EXPIRY JOB — fires 15 mins after a game starts and
+# posts an expiry message if the game wasn't completed.
+# ============================================================
+
+async def expire_grid_job(context):
+    data = context.job.data
+    chat_id = data["chat_id"]
+    started_at = data["started_at"]
+
+    key = chat_id
+    lock = _get_grid_lock(key)
+
+    async with lock:
+        game = GRID_GAMES.get(key)
+
+        # If the game no longer exists it was already completed —
+        # do nothing. If a brand-new game started with a different
+        # started_at, this job is stale — also do nothing.
+        if not game or game.get("started_at") != started_at:
+            return
+
+        GRID_GAMES.pop(key, None)
+
+    found_count = len(game.get("found", set()))
+    total = len(game.get("words", []))
+    scoreboard = game.get("scoreboard", {})
+    remaining_words = sorted(game.get("remaining", set()))
+
+    if scoreboard:
+        lines = sorted(
+            scoreboard.items(),
+            key=lambda item: item[1]["count"],
+            reverse=True,
+        )
+        board_text = "\n".join(
+            f"👤 {data['name']} — {data['count']} word(s)"
+            for _, data in lines
+        )
+    else:
+        board_text = "Nobody found any words this round."
+
+    missed = ", ".join(remaining_words) if remaining_words else "None"
+
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "⏰ **GRID TIME'S UP!**\n\n"
+                f"The word search ended with **{found_count}/{total}** words found.\n\n"
+                f"**Players this round:**\n{board_text}\n\n"
+                f"🔍 **Missed words:** {missed}\n\n"
+                "Run /grid to start a new game!"
+            ),
+            parse_mode="Markdown"
+        )
+    except Exception as error:
+        logger.warning(f"Grid expiry message error: {error}")
+
+
+# ============================================================
+# GRIDBOARD — shows who has found the most words, with a
+# group / worldwide toggle via inline buttons.
+# ============================================================
+
+def _build_gridboard_text(scores_dict, title):
+    if not scores_dict:
+        return f"🎮 **{title}**\n\nNo grid games played yet."
+
+    ranked = sorted(
+        scores_dict.items(),
+        key=lambda item: item[1]["words"],
+        reverse=True,
+    )
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = [f"🎮 **{title}**", "━━━━━━━━━━━━━━━━━━━━", ""]
+
+    for i, (uid, data) in enumerate(ranked[:15], 0):
+        medal = medals[i] if i < 3 else f"{i + 1}."
+        lines.append(f"{medal} {data['name']} — {data['words']} word(s)")
+
+    return "\n".join(lines)
+
+
+def _gridboard_keyboard(view):
+    other_view = "worldwide" if view == "group" else "group"
+    label = "🌍 Worldwide" if other_view == "worldwide" else "👥 Group"
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(label, callback_data=f"gridboard_{other_view}")
+    ]])
+
+
+async def gridboard_command(update, context):
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if not chat or not user:
+        return
+
+    group_scores = GRID_GROUP_SCORES.get(chat.id, {})
+    text = _build_gridboard_text(group_scores, "GROUP GRID LEADERBOARD")
+
+    await update.effective_message.reply_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=_gridboard_keyboard("group")
+    )
+
+
+async def gridboard_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    chat = update.effective_chat
+    view = query.data.split("_", 1)[1]  # "group" or "worldwide"
+
+    if view == "worldwide":
+        text = _build_gridboard_text(
+            GRID_WORLDWIDE_SCORES,
+            "WORLDWIDE GRID LEADERBOARD"
+        )
+        keyboard = _gridboard_keyboard("worldwide")
+    else:
+        group_scores = GRID_GROUP_SCORES.get(chat.id, {})
+        text = _build_gridboard_text(group_scores, "GROUP GRID LEADERBOARD")
+        keyboard = _gridboard_keyboard("group")
+
+    await query.edit_message_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+
+
 # ============================================================
 # GRID COMMAND — multiplayer: shared per group, not per user
 # ============================================================
@@ -1631,7 +1800,7 @@ async def grid_command(update, context):
             + "\n".join(clue_lines)
             + f"\n\n🎯 Difficulty: {difficulty.upper()}"
             + "\n💰 Each word = +10 XP (goes to whoever finds it)"
-            + "\n⏱️ Time: 5 minutes"
+            + "\n⏱️ Time: 15 minutes"
             + "\n\n🧠 Find the words inside the image."
             + "\nSend the complete word when you find it."
         )
@@ -1643,7 +1812,8 @@ async def grid_command(update, context):
             "placements": placements,
             "board": board,
             "difficulty": difficulty,
-            "expires": time.time() + 300,
+            "expires": time.time() + 900,
+            "started_at": time.time(),
             "grid_size": grid_size,
             "image_path": image_path,
             "message_id": None,
@@ -1651,6 +1821,15 @@ async def grid_command(update, context):
         }
 
         GRID_GAMES[key] = game
+
+        # Schedule the expiry message for 15 minutes from now.
+        # Pass started_at so the job can confirm it is for THIS game
+        # and not a newer one that started in the same chat.
+        context.job_queue.run_once(
+            expire_grid_job,
+            900,
+            data={"chat_id": chat.id, "started_at": game["started_at"]}
+        )
 
         try:
             with open(
@@ -1761,6 +1940,9 @@ async def grid_answer_handler(update, context):
             {"name": user.first_name, "count": 0}
         )
         entry["count"] += 1
+
+        # Update the persistent leaderboard scores (group + worldwide)
+        _update_grid_scores(chat.id, user.id, user.first_name, 1)
 
         is_complete = not game["remaining"]
 
