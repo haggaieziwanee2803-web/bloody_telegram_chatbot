@@ -244,7 +244,8 @@ def main():
     app.add_handler(CommandHandler("gamble", h.gamble_command))
     app.add_handler(CommandHandler("steal", h.steal_command))
     app.add_handler(CommandHandler("duel", h.duel_command))
-
+    app.add_handler(CommandHandler("gridboard", h.gridboard_command))
+    app.add_handler(CallbackQueryHandler(h.gridboard_callback, pattern="^gridboard_"))
     # NOTE: upgraded_features.py also defines its own rps/coinflip/
     # dice/slots_command. They're NOT registered below on purpose —
     # registering both would make the bot reply twice to the same
