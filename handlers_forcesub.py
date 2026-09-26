@@ -51,21 +51,6 @@ logger = logging.getLogger(__name__)
 
 FORCE_SUB_CHANNELS = [
     {
-        "name": "Devil's domain",
-        "chat_id": "@justforfun3668",
-        "join_url": "https://t.me/justforfun3668",
-    },
-    {
-        "name": "Devil's domain 2",
-        "chat_id": "@bloodyhazybotgroup",
-        "join_url": "https://t.me/bloodyhazybotgroup"
-    },
-    {
-        "name": "The unarchives",
-        "chat_id": "@eunicedomain",
-        "join_url": "https://t.me/eunicedomain"
-    },
-    {
         "name": "DEITY BLOODY's DOMAIN",
         "chat_id": "@deitybloodydomain",
         "join_url": "https://t.me/deitybloodydomain"

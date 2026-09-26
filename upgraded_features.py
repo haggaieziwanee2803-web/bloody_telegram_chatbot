@@ -1,7 +1,7 @@
 """
 BLOODY MD — ULTIMATE UPGRADE PACK
 Adds security, moderation, group utilities and games without replacing
-the existing AI / voice / music / XP systems in handlers_admin.py.
+the existing AI / voice / music / CE systems in handlers_admin.py.
 """
 
 import logging
@@ -29,7 +29,7 @@ def _load():
     # by a lock. The old version of this function read the file
     # straight off disk, bypassing that cache entirely — which meant
     # a save from database.py (which happens constantly, e.g. every
-    # time someone earns XP) could silently overwrite whatever this
+    # time someone earns CE) could silently overwrite whatever this
     # file had just written, and vice versa. Routing through db.load_db()
     # / db.save_db() below means both files are working with the same
     # single source of truth, so changes never clobber each other.
@@ -1063,7 +1063,7 @@ async def ultimate_menu_command(update, context):
 
 🩸 BLOODY MD
 
-⚡ AI • VOICE • XP • MUSIC • GAMES
+⚡ AI • VOICE • CE • MUSIC • GAMES
 🛡️ SECURITY • MODERATION • GROUP TOOLS
 """
     await update.effective_message.reply_text(menu)

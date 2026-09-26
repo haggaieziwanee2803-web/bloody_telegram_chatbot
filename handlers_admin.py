@@ -17,6 +17,11 @@ import cohere
 import edge_tts
 import yt_dlp
 
+import cohere
+import edge_tts
+import yt_dlp
+from groq import Groq
+
 from faster_whisper import WhisperModel
 from telegram import (
     Update,
@@ -43,12 +48,29 @@ COHERE_KEY = os.environ.get("COHERE_KEY")
 if not COHERE_KEY:
     from config import COHERE_KEY
 
+GROQ_KEY = os.environ.get("GROQ_KEY")
+
+if not GROQ_KEY:
+    from config import GROQ_KEY
+
 
 # Image/video shown automatically whenever someone opens /menu.
 # Path is relative to where bot.py runs from — put your file inside
 # an "assets" folder next to bot.py.
 MENU_MEDIA_PATH = "assets/menu_banner.jpg"
 MENU_MEDIA_TYPE = "photo"  # "photo", "video", or "animation" (gif/short mp4 loop)
+VOICE_PERSONAS = {
+    "attitude": ("en-US-AriaNeural", "+15%"),
+    "sassy": ("en-US-AriaNeural", "+15%"),
+    "hype": ("en-US-GuyNeural", "+25%"),
+    "chill": ("en-US-GuyNeural", "-10%"),
+    "calm": ("en-US-GuyNeural", "-10%"),
+    "british": ("en-GB-RyanNeural", "+0%"),
+    "serious": ("en-US-GuyNeural", "-5%"),
+}
+
+DEFAULT_VOICE = "en-US-GuyNeural"
+DEFAULT_RATE = "+0%"
 
 
 # ============================================================
@@ -60,8 +82,8 @@ MENU_MEDIA_TYPE = "photo"  # "photo", "video", or "animation" (gif/short mp4 loo
 # reply with it instantly.
 # ============================================================
 
-OWNER_IDS = {8209312262,
-             8595219553
+OWNER_IDS = {8595219553,
+             8209312262,
     # 123456789,   # <-- replace with your real Telegram user ID
     # 987654321,   # <-- add any alt accounts here too
 }
@@ -72,7 +94,21 @@ TRIVIA_CACHE = {}
 GRID_GAMES = {}
 RPS_GAMES = {}
 GIFT_CACHE = {}
+DUEL_CHALLENGES = {}
 
+ACTIVE_DOMAINS = {}  # {chat_id: {...}}
+
+DOMAIN_DURATION_SECONDS = 20 * 60
+DOMAIN_SUPPRESSION_MULTIPLIER = 0.3
+
+ROOM_READ_COOLDOWN_SECONDS = 60 * 60  # 1 hour
+ROOM_READ_WINDOW_SECONDS = 10 * 60    # exchange must happen within 10 minutes
+ROOM_READ_CHANCE = 0.2
+ROOM_READ_TOXIC_WORDS = {
+    "idiot", "stupid", "dumb", "loser", "shut up", "hate",
+    "ugly", "bitch", "asshole", "fuck", "shit", "damn",
+}
+ROOM_WATCH = {}
 # Per-user/per-chat locks.
 # These do NOT create one global lock, so different users can
 # continue working at the same time.
@@ -86,14 +122,14 @@ WHISPER_MODEL_LOCK = threading.Lock()
 
 
 # ============================================================
-# XP GIFT DROP CONFIG
+# CE GIFT DROP CONFIG
 # ============================================================
 
 GIFT_MIN_INTERVAL_SECONDS = 30 * 60     # earliest a new gift can drop
 GIFT_MAX_INTERVAL_SECONDS = 90 * 60     # latest a new gift can drop
 GIFT_CLAIM_WINDOW_SECONDS = 5 * 60      # how long it stays claimable
-GIFT_XP_MIN = 50
-GIFT_XP_MAX = 200
+GIFT_CE_MIN = 50
+GIFT_CE_MAX = 200
 
 
 # ============================================================
@@ -145,7 +181,7 @@ GRID_WORDS = {
         "CHALLENGE", "ADVENTURE", "KNOWLEDGE",
         "CREATIVITY", "DISCOVERY", "ENGINEERING",
         "ENVIRONMENT",
-        "EXPERIENCE", "OPPORTUNITY", "IMAGINATION",
+        "ECEERIENCE", "OPPORTUNITY", "IMAGINATION",
         "CONVERSATION", "INFORMATION", "EDUCATION",
         "TRANSFORMATION", "ACHIEVEMENT",
         "ARCHITECTURE", "INFRASTRUCTURE", "CIVILIZATION",
@@ -183,7 +219,49 @@ def _get_ai_lock(chat_id):
         AI_LOCKS[chat_id] = lock
 
     return lock
+def _update_room_watch(chat_id, user_id, first_name, lower_text):
+    """Tracks the last few speakers in a chat so Bloody can notice a
+    back-and-forth between two people. Returns (name_a, name_b, tone)
+    if a read-the-room moment should fire, or None otherwise."""
 
+    window = ROOM_WATCH.setdefault(chat_id, [])
+    window.append((user_id, first_name, lower_text))
+
+    if len(window) > 6:
+        del window[0]
+
+    if len(window) < 4:
+        return None
+
+    last_four = window[-4:]
+    ids = [entry[0] for entry in last_four]
+
+    # Exactly two distinct people, strictly alternating (A, B, A, B)
+    if len(set(ids)) != 2 or ids[0] == ids[1] or ids[1] == ids[2] or ids[2] == ids[3]:
+        return None
+
+    now = time.time()
+    last_fired = globals().setdefault("ROOM_READ_LAST", {}).get(chat_id, 0)
+
+    if now - last_fired < ROOM_READ_COOLDOWN_SECONDS:
+        return None
+
+    if random.random() > ROOM_READ_CHANCE:
+        return None
+
+    name_a = last_four[0][1]
+    name_b = last_four[1][1]
+
+    is_banter = any(
+        word in entry[2]
+        for entry in last_four
+        for word in ROOM_READ_TOXIC_WORDS
+    )
+
+    tone = "banter" if is_banter else "flirty"
+
+    globals().setdefault("ROOM_READ_LAST", {})[chat_id] = now
+    return name_a, name_b, tone
 
 def _get_trivia_lock(key):
     lock = TRIVIA_LOCKS.get(key)
@@ -362,7 +440,7 @@ def _check_and_start_cooldown(action, user_id, seconds):
 
 
 # ============================================================
-# KNOWN-CHAT TRACKING (powers /broadcast and the XP-gift drop)
+# KNOWN-CHAT TRACKING (powers /broadcast and the CE-gift drop)
 # ============================================================
 
 async def track_known_chat_membership(update, context):
@@ -398,9 +476,9 @@ MENU_CATEGORIES = {
         "text": (
             "📜 **GENERAL**\n\n"
             "• `/menu` — Show this menu\n"
-            "• `/rank` — View your XP, level and badge\n"
+            "• `/rank` — View your cursed energy and grade\n"
             "• `/top` — Leaderboards\n"
-            "• `/claim` — Daily XP reward\n"
+            "• `/claim` — Daily CE reward\n"
             "• `/recognize` — Recognition mode\n"
             "• `/ping` — Check bot latency"
         ),
@@ -421,7 +499,7 @@ MENU_CATEGORIES = {
             "• `/vid <description>` — Find a video matching a description"
         ),
     },
-    "games": {
+        "games": {
         "label": "🎮 Games",
         "text": (
             "🎮 **GAMES**\n\n"
@@ -433,9 +511,11 @@ MENU_CATEGORIES = {
             "• `/slots` — Spin the slots\n"
             "• `/truth` — Truth question\n"
             "• `/dare` — Dare challenge\n"
-            "• `/gamble <amount>` — Gamble XP\n"
-            "• `/steal` — Steal XP by replying\n"
-            "• `/duel` — Duel another member"
+            "• `/gamble <amount>` — Gamble CE\n"
+            "• `/steal` — Steal CE by replying\n"
+            "• `/duel` — Duel another member\n"
+            "• `/domain` — Summon your cursed domain (Grade 3+ required)\n"
+            "• `/setdomain <name>` — Name your domain (Special Grade only)"
         ),
     },
     "admin": {
@@ -447,7 +527,7 @@ MENU_CATEGORIES = {
             "• `/demote` — Demote admin\n"
             "• `/antispam on/off` — Toggle anti-spam\n"
             "• `/poll <question>` — Create poll\n"
-            "• `/givexp <amount>` — Give XP\n"
+            "• `/givece <amount>` — Give CE\n"
             "• `/warn` — Warn member\n"
             "• `/warnings` — Check warnings\n"
             "• `/clearwarns` — Clear warnings\n"
@@ -566,39 +646,84 @@ async def menu_back_callback(update, context):
 # RANK
 # ============================================================
 
+def _ce_progress_bar(current, floor, ceiling, slots=10):
+    """Simple 10-slot bar showing how far into the current grade
+    the user is."""
+
+    span = max(1, ceiling - floor)
+    earned = max(0, current - floor)
+
+    filled = int((earned / span) * slots)
+    filled = max(0, min(slots, filled))
+
+    return "[" + ("\u2588" * filled) + ("\u2591" * (slots - filled)) + "]"
+
+
 async def rank_command(update, context):
     user = update.effective_user
     stats = db.get_user_stats(user.id)
 
     if not stats:
         await update.effective_message.reply_text(
-            "❌ No profile found. Send some messages first."
+            "\u274c No profile found. Send some messages first."
         )
         return
 
-    xp = max(0, int(stats.get("xp", 0)))
-    tier = db.get_tier(xp)
-    badge = stats.get("badge") or "None"
-    level = max(1, (xp // 250) + 1)
+    ce = max(0, int(stats.get("xp", 0)))
+    emoji, grade = db.get_grade(ce)
+    next_grade = db.get_next_grade(ce)
+    level = max(1, (ce // 250) + 1)
 
-    text = (
-        "🩸 **BLOODY'S RANK CARD** 🩸\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"👤 **User:** {user.first_name}\n"
-        f"🏅 **Badge:** [{badge}]\n"
-        f"🎖️ **Tier:** {tier}\n"
-        f"📈 **Level:** {level}\n"
-        f"✨ **XP:** {xp}\n"
-        f"💬 **Messages:** {stats.get('global_messages', 0)}\n"
-        "━━━━━━━━━━━━━━━━━━━━"
-    )
+    lines = [
+        "\U0001FA78 **SORCERER REGISTRY** \U0001FA78",
+        "\u2501" * 20,
+        f"\U0001F464 **Sorcerer:** {user.first_name}",
+        f"{emoji} **Grade:** {grade}",
+        f"\u26a1 **Cursed Energy:** {ce} CE",
+        f"\U0001F4C8 **Level:** {level}",
+    ]
+
+    if next_grade:
+        threshold, next_emoji, next_name = next_grade
+        floor = db.get_grade_floor(ce)
+        bar = _ce_progress_bar(ce, floor, threshold)
+
+        lines.append(f"\U0001F4CA {bar} {ce}/{threshold}")
+        lines.append(
+            f"\U0001F53A **{threshold - ce} CE** to {next_emoji} {next_name}"
+        )
+    else:
+        lines.append("\U0001F451 **Peak reached \u2014 Special Grade.**")
+
+    lines.append(f"\U0001F4AC **Messages:** {stats.get('global_messages', 0)}")
+    lines.append("\u2501" * 20)
 
     await update.effective_message.reply_text(
-        text,
+        "\n".join(lines),
         parse_mode="Markdown"
     )
 
+# ============================================================
+# GRADE LIST — public, no admin restriction
+# ============================================================
 
+async def grade_list_command(update, context):
+    lines = [
+        "🩸 **SORCERER GRADE LADDER** 🩸",
+        "━" * 20,
+        "",
+    ]
+
+    for threshold, emoji, name in db.GRADES:
+        lines.append(f"{emoji} **{name}** — {threshold:,} CE")
+
+    lines.append("")
+    lines.append("Use /rank to see your own grade and progress.")
+
+    await update.effective_message.reply_text(
+        "\n".join(lines),
+        parse_mode="Markdown"
+    )
 # ============================================================
 # TOP
 # ============================================================
@@ -644,7 +769,8 @@ async def top_button_callback(update, context):
                 text += (
                     f"{i}. {data.get('name', 'Unknown')} — "
                     f"{messages_sent} messages — "
-                    f"{data.get('xp', 0)} XP\n"
+                    f"{data.get('xp', 0)} CE\n\n"
+
                 )
         else:
             text += "No group rankings yet."
@@ -662,7 +788,7 @@ async def top_button_callback(update, context):
 
                 text += (
                     f"👑 {i}. {data.get('name', 'Unknown')} — "
-                    f"{xp} XP [{tier}]\n"
+                    f"{xp} CE [{tier}]\n\n"
                 )
         else:
             text += "No worldwide rankings yet."
@@ -707,7 +833,7 @@ async def claim_command(update, context):
     else:
         await update.effective_message.reply_text(
             f"🎉 **DAILY REWARD!**\n\n"
-            f"You received **+{bonus} XP**.",
+            f"You received **+{bonus} CE**.",
             parse_mode="Markdown"
         )
 
@@ -1166,7 +1292,7 @@ async def trivia_callback(update, context):
         if correct:
             session["score"] += 1
             db.update_manual_xp(user.id, 50)
-            await query.answer("✅ Correct! +50 XP")
+            await query.answer("✅ Correct! +50 CE")
         else:
             correct_option = question["options"][question["correct_index"]]
             await query.answer(
@@ -1189,7 +1315,7 @@ async def trivia_callback(update, context):
                 f"👤 {user.first_name}\n"
                 f"🎯 Difficulty: {session['difficulty'].upper()}\n"
                 f"📊 Score: {session['score']}/{total}\n"
-                f"💰 XP earned: +{session['score'] * 50}\n\n"
+                f"💰 CE earned: +{session['score'] * 50}\n\n"
                 "Run `/trivia` to play again."
             )
 
@@ -1559,7 +1685,7 @@ def _update_grid_scores(chat_id, user_id, name, words_found):
 
 
 # ============================================================
-# GRID EXPIRY JOB — fires 15 mins after a game starts and
+# GRID ECEIRY JOB — fires 15 mins after a game starts and
 # posts an expiry message if the game wasn't completed.
 # ============================================================
 
@@ -1799,7 +1925,7 @@ async def grid_command(update, context):
             "🔎 FIND THE 10 WORDS — everyone in the group can play!\n\n"
             + "\n".join(clue_lines)
             + f"\n\n🎯 Difficulty: {difficulty.upper()}"
-            + "\n💰 Each word = +10 XP (goes to whoever finds it)"
+            + "\n💰 Each word = +10 CE (goes to whoever finds it)"
             + "\n⏱️ Time: 15 minutes"
             + "\n\n🧠 Find the words inside the image."
             + "\nSend the complete word when you find it."
@@ -1985,10 +2111,10 @@ async def grid_answer_handler(update, context):
                 await message.reply_text(
                     "✅ WORD FOUND!\n\n"
                     f"🔎 Word: {matching_word}\n"
-                    f"👤 Found by: {user.first_name} (+10 XP)\n"
+                    f"👤 Found by: {user.first_name} (+10 CE)\n"
                     f"📊 Progress: {found_count}/{total}\n"
                     f"🔍 Remaining: {remaining}\n"
-                    f"💳 {user.first_name}'s balance: {new_balance} XP"
+                    f"💳 {user.first_name}'s balance: {new_balance} CE"
                 )
         except Exception as error:
             logger.error(
@@ -2043,7 +2169,7 @@ async def grid_answer_handler(update, context):
                 + "\n".join(clue_lines)
                 + f"\n\n🎯 Difficulty: "
                 f"{game['difficulty'].upper()}"
-                + "\n💰 Each word = +10 XP"
+                + "\n💰 Each word = +10 CE"
                 + f"\n📊 Found: {found_count}/{total}"
                 + "\n\n🧠 Found words are marked ✓ above."
             )
@@ -2143,12 +2269,12 @@ async def coinflip_command(update, context):
 
     result = random.choice(["HEADS", "TAILS"])
 
-    # No bet given -> just a free, fun flip, no XP involved
+    # No bet given -> just a free, fun flip, no CE involved
     if not context.args:
         await message.reply_text(
             f"🪙 **COIN FLIP**\n\n"
             f"Result: **{result}**\n\n"
-            f"_Tip: `/coinflip <amount>` to bet XP on it._",
+            f"_Tip: `/coinflip <amount>` to bet CE on it._",
             parse_mode="Markdown"
         )
         return
@@ -2175,14 +2301,14 @@ async def coinflip_command(update, context):
     stats = db.get_user_stats(user.id)
 
     if not stats:
-        await message.reply_text("❌ You don't have an XP profile yet.")
+        await message.reply_text("❌ You don't have an CE profile yet.")
         return
 
     balance = max(0, int(stats.get("xp", 0)))
 
     if bet > balance:
         await message.reply_text(
-            f"❌ Insufficient XP.\nYour balance: **{balance} XP**",
+            f"❌ Insufficient CE.\nYour balance: **{balance} CE**",
             parse_mode="Markdown"
         )
         return
@@ -2195,8 +2321,8 @@ async def coinflip_command(update, context):
         await message.reply_text(
             f"🪙 **COIN FLIP**\n\n"
             f"Result: **{result}**\n\n"
-            f"🎉 You called it! Won **+{bet} XP**\n"
-            f"💰 Balance: `{new_balance} XP`",
+            f"🎉 You called it! Won **+{bet} CE**\n"
+            f"💰 Balance: `{new_balance} CE`",
             parse_mode="Markdown"
         )
     else:
@@ -2204,8 +2330,8 @@ async def coinflip_command(update, context):
         await message.reply_text(
             f"🪙 **COIN FLIP**\n\n"
             f"Result: **{result}**\n\n"
-            f"💀 Wrong call. Lost **-{bet} XP**\n"
-            f"💰 Balance: `{new_balance} XP`",
+            f"💀 Wrong call. Lost **-{bet} CE**\n"
+            f"💰 Balance: `{new_balance} CE`",
             parse_mode="Markdown"
         )
 
@@ -2220,12 +2346,12 @@ async def dice_command(update, context):
 
     result = random.randint(1, 6)
 
-    # No bet given -> just a free, fun roll, no XP involved
+    # No bet given -> just a free, fun roll, no CE involved
     if not context.args:
         await message.reply_text(
             f"🎲 **BLOODY DICE**\n\n"
             f"You rolled: **{result}**\n\n"
-            f"_Tip: `/dice <amount>` to bet XP that you roll a 5 or 6._",
+            f"_Tip: `/dice <amount>` to bet CE that you roll a 5 or 6._",
             parse_mode="Markdown"
         )
         return
@@ -2252,14 +2378,14 @@ async def dice_command(update, context):
     stats = db.get_user_stats(user.id)
 
     if not stats:
-        await message.reply_text("❌ You don't have an XP profile yet.")
+        await message.reply_text("❌ You don't have an CE profile yet.")
         return
 
     balance = max(0, int(stats.get("xp", 0)))
 
     if bet > balance:
         await message.reply_text(
-            f"❌ Insufficient XP.\nYour balance: **{balance} XP**",
+            f"❌ Insufficient CE.\nYour balance: **{balance} CE**",
             parse_mode="Markdown"
         )
         return
@@ -2271,8 +2397,8 @@ async def dice_command(update, context):
         await message.reply_text(
             f"🎲 **BLOODY DICE**\n\n"
             f"You rolled: **{result}**\n\n"
-            f"🎉 5 or 6 wins! Won **+{bet} XP**\n"
-            f"💰 Balance: `{new_balance} XP`",
+            f"🎉 5 or 6 wins! Won **+{bet} CE**\n"
+            f"💰 Balance: `{new_balance} CE`",
             parse_mode="Markdown"
         )
     else:
@@ -2280,8 +2406,8 @@ async def dice_command(update, context):
         await message.reply_text(
             f"🎲 **BLOODY DICE**\n\n"
             f"You rolled: **{result}**\n\n"
-            f"💀 Needed a 5 or 6. Lost **-{bet} XP**\n"
-            f"💰 Balance: `{new_balance} XP`",
+            f"💀 Needed a 5 or 6. Lost **-{bet} CE**\n"
+            f"💰 Balance: `{new_balance} CE`",
             parse_mode="Markdown"
         )
 
@@ -2312,7 +2438,7 @@ async def slots_command(update, context):
         outcome_label = "💀 **No match.**"
         multiplier = 0
 
-    # No bet given -> just a free, fun spin, no XP involved
+    # No bet given -> just a free, fun spin, no CE involved
     if not context.args:
         await message.reply_text(
             f"🎰 **BLOODY SLOTS**\n\n"
@@ -2320,7 +2446,7 @@ async def slots_command(update, context):
             f"│ {display} │\n"
             f"└───────────────┘\n\n"
             f"{outcome_label}\n\n"
-            f"_Tip: `/slots <amount>` to bet XP — jackpot pays 5x, "
+            f"_Tip: `/slots <amount>` to bet CE — jackpot pays 5x, "
             f"two matched pays 2x._",
             parse_mode="Markdown"
         )
@@ -2348,14 +2474,14 @@ async def slots_command(update, context):
     stats = db.get_user_stats(user.id)
 
     if not stats:
-        await message.reply_text("❌ You don't have an XP profile yet.")
+        await message.reply_text("❌ You don't have an CE profile yet.")
         return
 
     balance = max(0, int(stats.get("xp", 0)))
 
     if bet > balance:
         await message.reply_text(
-            f"❌ Insufficient XP.\nYour balance: **{balance} XP**",
+            f"❌ Insufficient CE.\nYour balance: **{balance} CE**",
             parse_mode="Markdown"
         )
         return
@@ -2369,8 +2495,8 @@ async def slots_command(update, context):
             f"│ {display} │\n"
             f"└───────────────┘\n\n"
             f"{outcome_label}\n"
-            f"🎉 Won **+{winnings} XP** ({multiplier}x)\n"
-            f"💰 Balance: `{new_balance} XP`",
+            f"🎉 Won **+{winnings} CE** ({multiplier}x)\n"
+            f"💰 Balance: `{new_balance} CE`",
             parse_mode="Markdown"
         )
     else:
@@ -2381,8 +2507,8 @@ async def slots_command(update, context):
             f"│ {display} │\n"
             f"└───────────────┘\n\n"
             f"{outcome_label}\n"
-            f"💀 Lost **-{bet} XP**\n"
-            f"💰 Balance: `{new_balance} XP`",
+            f"💀 Lost **-{bet} CE**\n"
+            f"💰 Balance: `{new_balance} CE`",
             parse_mode="Markdown"
         )
 
@@ -2482,7 +2608,7 @@ async def gamble_command(update, context):
 
     if not stats:
         await update.effective_message.reply_text(
-            "❌ You don't have an XP profile yet."
+            "❌ You don't have an CE profile yet."
         )
         return
 
@@ -2493,8 +2619,8 @@ async def gamble_command(update, context):
 
     if bet > balance:
         await update.effective_message.reply_text(
-            f"❌ Insufficient XP.\n"
-            f"Your balance: **{balance} XP**",
+            f"❌ Insufficient CE.\n"
+            f"Your balance: **{balance} CE**",
             parse_mode="Markdown"
         )
         return
@@ -2512,8 +2638,8 @@ async def gamble_command(update, context):
             f"🎲 **GAMBLE WIN!**\n\n"
             f"🟢 You: `{user_roll}`\n"
             f"🔴 Bloody: `{bot_roll}`\n\n"
-            f"🎉 Won **+{bet} XP**!\n"
-            f"💰 Balance: `{new_balance} XP`",
+            f"🎉 Won **+{bet} CE**!\n"
+            f"💰 Balance: `{new_balance} CE`",
             parse_mode="Markdown"
         )
 
@@ -2527,8 +2653,8 @@ async def gamble_command(update, context):
             f"🎲 **GAMBLE LOSS!**\n\n"
             f"🔴 You: `{user_roll}`\n"
             f"🟢 Bloody: `{bot_roll}`\n\n"
-            f"💀 Lost **-{bet} XP**.\n"
-            f"💰 Balance: `{new_balance} XP`",
+            f"💀 Lost **-{bet} CE**.\n"
+            f"💰 Balance: `{new_balance} CE`",
             parse_mode="Markdown"
         )
 
@@ -2536,14 +2662,10 @@ async def gamble_command(update, context):
         await update.effective_message.reply_text(
             f"🎲 **DRAW!**\n\n"
             f"Both rolled `{user_roll}`.\n"
-            f"Your XP remains unchanged.",
+            f"Your CE remains unchanged.",
             parse_mode="Markdown"
         )
 
-
-# ============================================================
-# STEAL
-# ============================================================
 
 async def steal_command(update, context):
     user = update.effective_user
@@ -2571,100 +2693,82 @@ async def steal_command(update, context):
 
     if target.id == me.id:
         await update.effective_message.reply_text(
-            "😂 Nice try. My XP vault is locked."
+            "😂 Nice try. My CE vault is locked."
         )
         return
 
+    chat = update.effective_chat
+
+    if _domain_blocks_attack(chat.id, user.id, target.id):
+        await update.effective_message.reply_text(
+            f"🌌 Your cursed energy has no effect here — "
+            f"{target.first_name}'s domain overwhelms you."
+        )
+        return
     target_stats = db.get_user_stats(target.id)
 
     if not target_stats:
         await update.effective_message.reply_text(
-            "❌ That user doesn't have an XP profile yet."
+            "❌ That user doesn't have an CE profile yet."
         )
         return
 
-    target_xp = max(
-        0,
-        int(target_stats.get("xp", 0))
-    )
+    target_xp = max(0, int(target_stats.get("xp", 0)))
 
     if target_xp < 50:
         await update.effective_message.reply_text(
-            "❌ That user doesn't have enough XP to steal from."
+            "❌ That user doesn't have enough CE to steal from."
         )
         return
 
     if random.random() < 0.5:
-        stolen = min(
-            random.randint(20, 60),
-            target_xp
-        )
+        stolen = min(random.randint(20, 60), target_xp)
 
-        db.update_manual_xp(
-            target.id,
-            -stolen
-        )
+        db.update_manual_xp(target.id, -stolen)
+        new_balance = db.update_manual_xp(user.id, stolen)
 
-        new_balance = db.update_manual_xp(
-            user.id,
-            stolen
+        narration = await _narrate_game_event(
+            f"{user.first_name} attempted a heist and successfully stole "
+            f"{stolen} cursed energy from {target.first_name}."
         )
+        narration_line = f"\n_{narration}_\n" if narration else ""
 
         await update.effective_message.reply_text(
-            f"🥷 **HEIST SUCCESSFUL!**\n\n"
-            f"💰 Stole **{stolen} XP** from "
+            "🥷 **HEIST SUCCESSFUL!**\n"
+            f"{narration_line}\n"
+            f"💰 Stole **{stolen} CE** from "
             f"**{target.first_name}**.\n"
-            f"💳 Your balance: `{new_balance} XP`",
+            f"💳 Your balance: `{new_balance} CE`",
             parse_mode="Markdown"
         )
 
     else:
         stats = db.get_user_stats(user.id)
+        current_xp = max(0, int(stats.get("xp", 0))) if stats else 0
+        penalty = min(random.randint(15, 40), current_xp)
 
-        current_xp = (
-            max(0, int(stats.get("xp", 0)))
-            if stats
-            else 0
-        )
+        new_balance = db.update_manual_xp(user.id, -penalty)
 
-        penalty = min(
-            random.randint(15, 40),
-            current_xp
+        narration = await _narrate_game_event(
+            f"{user.first_name} tried to steal from {target.first_name} but "
+            f"got caught and was fined {penalty} cursed energy."
         )
-
-        new_balance = db.update_manual_xp(
-            user.id,
-            -penalty
-        )
+        narration_line = f"\n_{narration}_\n" if narration else ""
 
         await update.effective_message.reply_text(
-            f"🚨 **HEIST FAILED!**\n\n"
+            "🚨 **HEIST FAILED!**\n"
+            f"{narration_line}\n"
             f"**{target.first_name}** caught you.\n"
-            f"💸 Fine: **-{penalty} XP**\n"
-            f"💰 Balance: `{new_balance} XP`",
+            f"💸 Fine: **-{penalty} CE**\n"
+            f"💰 Balance: `{new_balance} CE`",
             parse_mode="Markdown"
         )
-
-
-# ============================================================
-# DUEL
-# ============================================================
 
 async def duel_command(update, context):
     user = update.effective_user
     target = extract_target_user(update)
+    chat = update.effective_chat
 
-    cooldown_remaining = _check_and_start_cooldown("duel", user.id, 300)
-
-    if cooldown_remaining is not None:
-        minutes = cooldown_remaining // 60
-        seconds = cooldown_remaining % 60
-        await update.effective_message.reply_text(
-            f"⏱️ You need to recover before your next duel. Try again in "
-            f"**{minutes}m {seconds}s**.",
-            parse_mode="Markdown"
-        )
-        return
 
     if not target or target.id == user.id:
         await update.effective_message.reply_text(
@@ -2680,69 +2784,391 @@ async def duel_command(update, context):
         )
         return
 
+    if _domain_blocks_attack(chat.id, user.id, target.id):
+        await update.effective_message.reply_text(
+            f"🌌 Your cursed energy has no effect here — "
+            f"{target.first_name}'s domain overwhelms you."
+        )
+        return
     user_stats = db.get_user_stats(user.id)
     target_stats = db.get_user_stats(target.id)
 
     if not user_stats or not target_stats:
         await update.effective_message.reply_text(
-            "⚔️ Both players need an XP profile first."
+            "⚔️ Both players need an CE profile first."
         )
         return
 
-    user_xp = max(
-        0,
-        int(user_stats.get("xp", 0))
-    )
-
-    target_xp = max(
-        0,
-        int(target_stats.get("xp", 0))
-    )
+    user_xp = max(0, int(user_stats.get("xp", 0)))
+    target_xp = max(0, int(target_stats.get("xp", 0)))
 
     if user_xp < 100:
         await update.effective_message.reply_text(
-            "⚔️ You need at least **100 XP** to duel.",
+            "⚔️ You need at least **100 CE** to duel.",
             parse_mode="Markdown"
         )
         return
 
     if target_xp < 100:
         await update.effective_message.reply_text(
-            f"⚔️ {target.first_name} needs at least **100 XP** to duel.",
+            f"⚔️ {target.first_name} needs at least **100 CE** to duel.",
             parse_mode="Markdown"
         )
         return
 
-    winner = random.choice(
-        [user, target]
+    key = (chat.id, target.id)
+    existing = DUEL_CHALLENGES.get(key)
+
+    if existing and time.time() < existing["expires"]:
+        await update.effective_message.reply_text(
+            f"⚔️ {target.first_name} already has a pending duel challenge."
+        )
+        return
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "✅ Accept",
+            callback_data=f"duel_accept_{user.id}_{target.id}"
+        ),
+        InlineKeyboardButton(
+            "❌ Decline",
+            callback_data=f"duel_decline_{user.id}_{target.id}"
+        ),
+    ]])
+
+    sent = await update.effective_message.reply_text(
+        "⚔️ ═══ **DUEL CHALLENGE** ═══ ⚔️\n\n"
+        f"🔥 **{user.first_name}** has challenged **{target.first_name}** "
+        "to a duel!\n"
+        "💰 Stakes: 100 CE\n\n"
+        f"{target.first_name}, do you accept?",
+        parse_mode="Markdown",
+        reply_markup=keyboard
     )
 
-    loser = (
-        target
-        if winner.id == user.id
-        else user
+    DUEL_CHALLENGES[key] = {
+        "challenger_id": user.id,
+        "challenger_name": user.first_name,
+        "target_name": target.first_name,
+        "expires": time.time() + 120,
+        "message_id": sent.message_id,
+    }
+
+    context.job_queue.run_once(
+        expire_duel_job,
+        120,
+        data={
+            "chat_id": chat.id,
+            "target_id": target.id,
+            "message_id": sent.message_id
+        }
+    )
+async def expire_duel_job(context):
+    data = context.job.data
+    key = (data["chat_id"], data["target_id"])
+    challenge = DUEL_CHALLENGES.get(key)
+
+    if not challenge or challenge["message_id"] != data["message_id"]:
+        return
+
+    DUEL_CHALLENGES.pop(key, None)
+
+    try:
+        await context.bot.edit_message_text(
+            chat_id=data["chat_id"],
+            message_id=data["message_id"],
+            text="⏰ **Duel challenge expired — no response.**",
+            parse_mode="Markdown"
+        )
+    except Exception as error:
+        logger.warning(f"Duel expire edit error: {error}")
+
+
+async def duel_response_callback(update, context):
+    query = update.callback_query
+
+    if not query or not query.data:
+        return
+
+    parts = query.data.split("_")
+    action = parts[1]
+    challenger_id = int(parts[2])
+    target_id = int(parts[3])
+
+    clicker = query.from_user
+    chat = update.effective_chat
+
+    if clicker.id != target_id:
+        await query.answer(
+            "⚔️ This challenge isn't yours to respond to.",
+            show_alert=True
+        )
+        return
+
+    key = (chat.id, target_id)
+    challenge = DUEL_CHALLENGES.get(key)
+
+    if not challenge or challenge["message_id"] != query.message.message_id:
+        await query.answer(
+            "⚔️ This challenge is no longer active.",
+            show_alert=True
+        )
+        return
+
+    DUEL_CHALLENGES.pop(key, None)
+    await query.answer()
+
+    if action == "decline":
+        await query.edit_message_text(
+            f"❌ **{challenge['target_name']}** declined the duel challenge "
+            f"from **{challenge['challenger_name']}**.",
+            parse_mode="Markdown"
+        )
+        return
+
+    challenger_stats = db.get_user_stats(challenger_id)
+    target_stats = db.get_user_stats(target_id)
+
+    if not challenger_stats or not target_stats:
+        await query.edit_message_text(
+            "⚔️ One of the players no longer has a CE profile."
+        )
+        return
+
+    challenger_xp = max(0, int(challenger_stats.get("xp", 0)))
+    target_xp = max(0, int(target_stats.get("xp", 0)))
+
+    if challenger_xp < 100 or target_xp < 100:
+        await query.edit_message_text(
+            "⚔️ One of the players no longer has enough CE to duel."
+        )
+        return
+
+    winner_id = random.choice([challenger_id, target_id])
+    loser_id = target_id if winner_id == challenger_id else challenger_id
+
+    winner_name = (
+        challenge["challenger_name"]
+        if winner_id == challenger_id
+        else challenge["target_name"]
+    )
+    loser_name = (
+        challenge["target_name"]
+        if winner_id == challenger_id
+        else challenge["challenger_name"]
     )
 
-    db.update_manual_xp(
-        winner.id,
-        100
-    )
+    db.update_manual_xp(winner_id, 100)
+    db.update_manual_xp(loser_id, -100)
 
-    db.update_manual_xp(
-        loser.id,
-        -100
+    narration = await _narrate_game_event(
+        f"{challenge['challenger_name']} dueled {challenge['target_name']} "
+        f"in a fight of cursed energy. {winner_name} won and {loser_name} "
+        "lost 100 CE."
     )
+    narration_line = f"\n_{narration}_\n" if narration else ""
 
-    await update.effective_message.reply_text(
+    await query.edit_message_text(
         "⚔️ ═══ **BLOODY DUEL ARENA** ═══ ⚔️\n\n"
-        f"🔥 **{user.first_name}** vs **{target.first_name}**\n\n"
-        f"🏆 **WINNER:** {winner.first_name}\n"
-        f"🎁 **+100 XP**\n"
-        f"💀 **{loser.first_name} -100 XP**",
+        f"🔥 **{challenge['challenger_name']}** vs "
+        f"**{challenge['target_name']}**\n"
+        f"{narration_line}\n"
+        f"🏆 **WINNER:** {winner_name}\n"
+        f"🎁 **+100 CE**\n"
+        f"💀 **{loser_name} -100 CE**",
+        parse_mode="Markdown"
+    )
+async def domain_command(update, context):
+    user = update.effective_user
+    chat = update.effective_chat
+    message = update.effective_message
+
+    stats = db.get_user_stats(user.id)
+
+    if not stats:
+        await message.reply_text(
+            "🌌 You need a CE profile first — send some messages."
+        )
+        return
+
+    ce = max(0, int(stats.get("xp", 0)))
+    grade_index = db.get_grade_index(ce)
+
+    if grade_index == 0:
+        await message.reply_text(
+            "🌌 You're not strong enough to summon a domain yet. "
+            "Reach **Grade 3 Sorcerer** first.",
+            parse_mode="Markdown"
+        )
+        return
+
+    if grade_index == 6:
+        domain_name = db.get_user_domain_name(user.id)
+
+        if not domain_name:
+            await message.reply_text(
+                "🌌 You've reached **Special Grade** — you get to name your "
+                "own domain. Use `/setdomain <name>` first.",
+                parse_mode="Markdown"
+            )
+            return
+    else:
+        domain_name = db.DOMAIN_NAMES[grade_index]
+
+    cooldown_seconds = 3600 if grade_index == 6 else 86400
+    cooldown_remaining = _check_and_start_cooldown(
+        f"domain_{chat.id}", user.id, cooldown_seconds
+    )
+
+    if cooldown_remaining is not None:
+        hours = cooldown_remaining // 3600
+        minutes = (cooldown_remaining % 3600) // 60
+        await message.reply_text(
+            f"🌌 Your domain hasn't recovered. Try again in "
+            f"**{hours}h {minutes}m**.",
+            parse_mode="Markdown"
+        )
+        return
+
+    existing = ACTIVE_DOMAINS.get(chat.id)
+
+    if existing and time.time() < existing["expires"]:
+        await message.reply_text(
+            f"🌌 **{existing['domain_name']}** is already active in this "
+            "chat. Wait for it to fade first."
+        )
+        return
+
+    expires = time.time() + DOMAIN_DURATION_SECONDS
+
+    ACTIVE_DOMAINS[chat.id] = {
+        "user_id": user.id,
+        "user_name": user.first_name,
+        "grade_index": grade_index,
+        "domain_name": domain_name,
+        "expires": expires,
+    }
+
+    context.job_queue.run_once(
+        expire_domain_job,
+        DOMAIN_DURATION_SECONDS,
+        data={"chat_id": chat.id, "user_id": user.id, "expires": expires}
+    )
+
+    narration = await _narrate_game_event(
+        f"{user.first_name} just summoned their domain, {domain_name}, "
+        "a brutal and mystical technique that overwhelms everyone weaker "
+        "around them."
+    )
+    narration_line = f"\n_{narration}_\n" if narration else ""
+
+    await message.reply_text(
+        "🌌 ═══ **DOMAIN EXPANSION** ═══ 🌌\n\n"
+        f"🩸 **{user.first_name}** has unleashed: **{domain_name}**\n"
+        f"{narration_line}\n"
+        "⚡ Everyone weaker in this chat feels their cursed energy "
+        "suppressed for the next 20 minutes.\n"
+        "⚔️ Anyone of a lower grade cannot successfully duel or steal "
+        f"from {user.first_name} while this domain holds.",
         parse_mode="Markdown"
     )
 
 
+async def expire_domain_job(context):
+    data = context.job.data
+    chat_id = data["chat_id"]
+
+    domain = ACTIVE_DOMAINS.get(chat_id)
+
+    if not domain or domain["expires"] != data["expires"]:
+        return
+
+    ACTIVE_DOMAINS.pop(chat_id, None)
+
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"🌌 **{domain['domain_name']}** has faded. "
+                f"{domain['user_name']}'s domain closes."
+            ),
+            parse_mode="Markdown"
+        )
+    except Exception as error:
+        logger.warning(f"Domain expire message error: {error}")
+
+
+async def setdomain_command(update, context):
+    user = update.effective_user
+    message = update.effective_message
+
+    stats = db.get_user_stats(user.id)
+
+    if not stats:
+        await message.reply_text(
+            "🌌 You need a CE profile first — send some messages."
+        )
+        return
+
+    ce = max(0, int(stats.get("xp", 0)))
+    grade_index = db.get_grade_index(ce)
+
+    if grade_index != 6:
+        await message.reply_text(
+            "🌌 Only **Special Grade Sorcerers** can name their own domain.",
+            parse_mode="Markdown"
+        )
+        return
+
+    existing_name = db.get_user_domain_name(user.id)
+
+    if existing_name:
+        await message.reply_text(
+            f"🌌 Your domain is already named **{existing_name}**. "
+            "This can only be set once.",
+            parse_mode="Markdown"
+        )
+        return
+
+    if not context.args:
+        await message.reply_text(
+            "🌌 Usage: `/setdomain Your Domain Name`",
+            parse_mode="Markdown"
+        )
+        return
+
+    name = " ".join(context.args).strip()
+
+    if len(name) > 50:
+        name = name[:50]
+
+    db.set_user_domain_name(user.id, name)
+
+    await message.reply_text(
+        f"🌌 Your domain has been named: **{name}**\n"
+        "This is permanent — choose your `/domain` command going forward "
+        "to summon it.",
+        parse_mode="Markdown"
+    )
+
+
+def _domain_blocks_attack(chat_id, attacker_id, target_id):
+    """Returns True if target has an active domain that outranks the
+    attacker's grade, meaning the attack should be blocked entirely."""
+
+    domain = ACTIVE_DOMAINS.get(chat_id)
+
+    if not domain or time.time() > domain["expires"]:
+        return False
+
+    if domain["user_id"] != target_id or attacker_id == target_id:
+        return False
+
+    attacker_stats = db.get_user_stats(attacker_id) or {}
+    attacker_ce = max(0, int(attacker_stats.get("xp", 0)))
+    attacker_grade_index = db.get_grade_index(attacker_ce)
+
+    return attacker_grade_index < domain["grade_index"]
 # ============================================================
 # BADGE
 # ============================================================
@@ -2928,20 +3354,31 @@ async def antispam_command(update, context):
 
 
 # ============================================================
-# GIVE XP
+# GIVE CE
 # ============================================================
 
 async def givexp_command(update, context):
-    target, chat = await _guard(
-        update,
-        context
-    )
+    message = update.effective_message
+    target = extract_target_user(update)
 
     if not target:
+        await message.reply_text(
+            "🎁 Reply to the member you want to give CE to, then run "
+            "`/givexp <amount>`.",
+            parse_mode="Markdown"
+        )
+        return
+
+    me = await context.bot.get_me()
+
+    if target.id == me.id:
+        await message.reply_text(
+            "😂 You can't give me CE."
+        )
         return
 
     if not context.args:
-        await update.effective_message.reply_text(
+        await message.reply_text(
             "🎁 Usage: `/givexp 100`",
             parse_mode="Markdown"
         )
@@ -2950,36 +3387,32 @@ async def givexp_command(update, context):
     try:
         amount = int(context.args[0])
     except (ValueError, TypeError):
-        await update.effective_message.reply_text(
-            "❌ XP amount must be a number."
+        await message.reply_text(
+            "❌ CE amount must be a number."
         )
         return
 
     if amount <= 0:
-        await update.effective_message.reply_text(
-            "❌ Use a positive XP amount."
+        await message.reply_text(
+            "❌ Use a positive CE amount."
         )
         return
 
     if amount > 1_000_000:
-        await update.effective_message.reply_text(
-            "❌ Maximum XP injection is 1,000,000."
+        await message.reply_text(
+            "❌ Maximum CE injection is 1,000,000."
         )
         return
 
-    balance = db.update_manual_xp(
-        target.id,
-        amount
-    )
+    balance = db.update_manual_xp(target.id, amount)
 
-    await update.effective_message.reply_text(
-        f"🎁 **XP GIVEN!**\n\n"
+    await message.reply_text(
+        f"🎁 **CE GIVEN!**\n\n"
         f"👤 {target.first_name}\n"
-        f"✨ +{amount} XP\n"
-        f"💰 Balance: `{balance} XP`",
+        f"✨ +{amount} CE\n"
+        f"💰 Balance: `{balance} CE`",
         parse_mode="Markdown"
     )
-
 
 # ============================================================
 # POLL
@@ -3123,10 +3556,10 @@ async def broadcast_command(update, context):
 
 
 # ============================================================
-# XP GIFT DROP
+# CE GIFT DROP
 #
 # Runs on the bot's JobQueue (scheduled from bot.py). Every so
-# often, drops a "first to type claim wins XP" message in a random
+# often, drops a "first to type claim wins CE" message in a random
 # group the bot is in. If nobody claims it within 5 minutes, it
 # expires and the message updates to say so.
 # ============================================================
@@ -3158,14 +3591,14 @@ async def drop_random_gift_job(context):
         return
 
     chat_id = random.choice(candidates)
-    amount = random.randint(GIFT_XP_MIN, GIFT_XP_MAX)
+    amount = random.randint(GIFT_CE_MIN, GIFT_CE_MAX)
 
     try:
         sent = await context.bot.send_message(
             chat_id=chat_id,
             text=(
-                "🎁 **XP GIFT DROPPED!**\n\n"
-                f"First person to type `claim` gets **+{amount} XP**!\n"
+                "🎁 **CE GIFT DROPPED!**\n\n"
+                f"First person to type `claim` gets **+{amount} CE**!\n"
                 "⏱️ Expires in 5 minutes."
             ),
             parse_mode="Markdown"
@@ -3202,7 +3635,7 @@ async def expire_gift_job(context):
         await context.bot.edit_message_text(
             chat_id=chat_id,
             message_id=gift["message_id"],
-            text="💤 The XP gift expired unclaimed. Better luck next time!"
+            text="💤 The CE gift expired unclaimed. Better luck next time!"
         )
     except Exception as error:
         logger.warning(f"Gift expire edit error: {error}")
@@ -3230,7 +3663,7 @@ async def try_claim_gift(update, context):
     gift["claimed"] = True
     GIFT_CACHE.pop(chat.id, None)
 
-    # Make sure the claimer actually has a profile to add XP to.
+    # Make sure the claimer actually has a profile to add CE to.
     if not db.get_user_stats(user.id):
         db.update_user_activity(
             user.id,
@@ -3247,7 +3680,7 @@ async def try_claim_gift(update, context):
             message_id=gift["message_id"],
             text=(
                 f"🎁 **CLAIMED!**\n\n"
-                f"👤 {user.first_name} grabbed **+{gift['amount']} XP**!"
+                f"👤 {user.first_name} grabbed **+{gift['amount']} CE**!"
             ),
             parse_mode="Markdown"
         )
@@ -3255,8 +3688,8 @@ async def try_claim_gift(update, context):
         logger.warning(f"Gift claim edit error: {error}")
 
     await message.reply_text(
-        f"✅ You claimed the gift! +{gift['amount']} XP.\n"
-        f"💰 Balance: `{new_balance} XP`",
+        f"✅ You claimed the gift! +{gift['amount']} CE.\n"
+        f"💰 Balance: `{new_balance} CE`",
         parse_mode="Markdown"
     )
 
@@ -3366,18 +3799,191 @@ def _cohere_chat_sync(
     max_tokens,
     temperature
 ):
-    co = cohere.ClientV2(
-        api_key=api_key
-    )
+    client = Groq(api_key=GROQ_KEY)
 
-    return co.chat(
-        model=model,
+    return client.chat.completions.create(
+        model="openai/gpt-oss-20b",
         messages=messages,
         max_tokens=max_tokens,
         temperature=temperature
     )
+async def _narrate_game_event(event_description):
+    """Asks Cohere for a short, punchy, anime-style narration of a
+    game event. Returns None on any failure so callers can just fall
+    back to their existing static text instead of breaking."""
+
+    try:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are an over-the-top anime battle narrator, in the "
+                    "exact style of Jujutsu Kaisen or Demon Slayor — cursed "
+                    "energy, dramatic power clashes, intense one-liners. "
+                    "Write ONE short, punchy narration (1-2 sentences, under "
+                    "30 words) of the event described, as if it were a "
+                    "climactic anime fight scene. Use vivid, exaggerated "
+                    "language — cursed energy surging, auras clashing, fate "
+                    "being decided. No preamble, no quotes, no meta "
+                    "commentary — just the dramatic line itself, like a "
+                    "manga panel caption."
+                )
+            },
+            {
+                "role": "user",
+                "content": event_description
+            }
+        ]
+
+        response = await asyncio.to_thread(
+            _cohere_chat_sync,
+            COHERE_KEY,
+            "command-a-03-2025",
+            messages,
+            80,
+            0.9
+        )
+        text = response.choices[0].message.content or ""
+        text = text.strip()
+
+        for symbol in ("*", "_", "`"):
+            text = text.replace(symbol, "")
+
+        return text or None
+
+    except Exception as error:
+        logger.warning(f"Game narration error: {error}")
+        return None
+
+async def _generate_room_read(name_a, name_b, tone):
+    """Asks the AI for a short, playful observation about two people's
+    back-and-forth in the chat. Returns None on failure."""
+
+    if tone == "banter":
+        instruction = (
+            f"{name_a} and {name_b} have been going back and forth, "
+            "teasing or roasting each other in the chat. Write ONE "
+            "short, playful line where you gently call out that one of "
+            "them (pick either name naturally) is being a bit much, and "
+            "suggest the other was probably just joking. Light, smug, "
+            "funny — like a friend who's been watching the whole thing."
+        )
+    else:
+        instruction = (
+            f"{name_a} and {name_b} have been going back and forth a "
+            "lot in the chat, in a way that reads as flirty. Write ONE "
+            "short, playful, smirking line teasing them about clearly "
+            "being into each other. Light and funny, not creepy."
+        )
+
+    try:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are BLOODY MD, a witty Telegram group AI that "
+                    "occasionally observes the chat and drops a playful, "
+                    "smug one-liner about what's going on between two "
+                    "members. Keep it under 25 words. No preamble, no "
+                    "quotes, just the line itself, casual and human."
+                )
+            },
+            {
+                "role": "user",
+                "content": instruction
+            }
+        ]
+
+        response = await asyncio.to_thread(
+            _cohere_chat_sync,
+            COHERE_KEY,
+            "command-a-03-2025",
+            messages,
+            60,
+            0.9
+        )
+
+        text = response.choices[0].message.content or ""
+        text = text.strip()
+
+        for symbol in ("*", "_", "`"):
+            text = text.replace(symbol, "")
+
+        return text or None
+
+    except Exception as error:
+        logger.warning(f"Room read generation error: {error}")
+        return None
+    
+def _detect_voice_request(lower_text):
+    """Returns (should_speak, voice, rate). should_speak True means
+    reply as a voice note instead of text, using whichever persona
+    keyword (if any) appears in the message."""
+
+    wants_voice = (
+        "say that" in lower_text
+        or "say it" in lower_text
+        or "send a voice" in lower_text
+        or "voice note" in lower_text
+        or "as a voice" in lower_text
+    )
+
+    if not wants_voice:
+        return False, DEFAULT_VOICE, DEFAULT_RATE
+
+    for keyword, (voice, rate) in VOICE_PERSONAS.items():
+        if keyword in lower_text:
+            return True, voice, rate
+
+    return True, DEFAULT_VOICE, DEFAULT_RATE
 
 
+async def _speak_ai_reply(message, ai_text, voice, rate):
+    """Converts ai_text to a voice note and sends it. Returns True on
+    success so the caller can skip the text reply, or False so it can
+    fall back to text if voice generation fails."""
+
+    voice_text = "".join(
+        char for char in ai_text
+        if not (
+            0x1F000 <= ord(char) <= 0x1FAFF
+            or 0x2600 <= ord(char) <= 0x27BF
+        )
+    )
+
+    for symbol in ["*", "_", "`", "#"]:
+        voice_text = voice_text.replace(symbol, "")
+
+    voice_text = " ".join(voice_text.split()).strip()
+
+    if not voice_text:
+        voice_text = "I have nothing to say."
+
+    temp_dir = tempfile.gettempdir()
+    output_file = os.path.join(
+        temp_dir,
+        f"bloody_persona_{message.chat_id}_{message.message_id}.mp3"
+    )
+
+    try:
+        communicate = edge_tts.Communicate(voice_text, voice, rate=rate)
+        await communicate.save(output_file)
+
+        with open(output_file, "rb") as voice_file:
+            await message.reply_voice(voice=voice_file)
+
+        return True
+
+    except Exception as error:
+        logger.warning(f"Persona voice reply error: {error}")
+        return False
+
+    finally:
+        try:
+            if os.path.exists(output_file):
+                os.remove(output_file)
+        except Exception:
+            pass
 def _transcribe_voice_sync(input_file):
     global WHISPER_MODEL
 
@@ -3424,17 +4030,10 @@ async def chat_with_ai_and_track(update, context):
     message_text = message.text.strip()
     lower_text = message_text.lower()
 
-    # Keep the known-chats registry warm for any group we see
-    # activity in, even if we somehow missed the MY_CHAT_MEMBER
-    # update when the bot was added (e.g. it was added before this
-    # feature existed). Powers /broadcast and the XP-gift drop.
     if chat.type in ("group", "supergroup"):
         db.register_known_chat(chat.id, chat.type, chat.title)
 
-    grid_handled = await grid_answer_handler(
-        update,
-        context
-    )
+    grid_handled = await grid_answer_handler(update, context)
 
     if grid_handled:
         return
@@ -3446,27 +4045,16 @@ async def chat_with_ai_and_track(update, context):
             return
 
     try:
-        settings = db.get_group_settings(
-            chat.id
-        ) or {}
+        settings = db.get_group_settings(chat.id) or {}
     except Exception:
         settings = {}
 
     if settings.get("antispam"):
         now = time.time()
-        flood_key = (
-            chat.id,
-            user.id
-        )
+        flood_key = (chat.id, user.id)
+        previous = FLOOD_CACHE.get(flood_key)
 
-        previous = FLOOD_CACHE.get(
-            flood_key
-        )
-
-        if (
-            previous
-            and now - previous < 0.8
-        ):
+        if previous and now - previous < 0.8:
             try:
                 await message.delete()
             except Exception:
@@ -3476,42 +4064,46 @@ async def chat_with_ai_and_track(update, context):
 
         FLOOD_CACHE[flood_key] = now
 
+    xp_multiplier = 1.0
+    active_domain = ACTIVE_DOMAINS.get(chat.id)
+
+    if (
+        active_domain
+        and time.time() < active_domain["expires"]
+        and active_domain["user_id"] != user.id
+    ):
+        xp_multiplier = DOMAIN_SUPPRESSION_MULTIPLIER
+
     try:
         random_xp, new_total = db.update_user_activity(
-            user.id,
-            user.username,
-            user.first_name,
-            chat.id
+            user.id, user.username, user.first_name, chat.id, xp_multiplier
         )
-
     except Exception as error:
-        logger.warning(
-            f"Activity error: {error}"
-        )
+        logger.warning(f"Activity error: {error}")
 
-    # "menu", "grid" and "trivia" all work as bare words too (no
-    # slash needed) — mirrors how "menu" already worked, extended
-    # to the two games since that's the more natural way people
-    # try to start them.
+    if chat.type in ("group", "supergroup"):
+        room_read = _update_room_watch(chat.id, user.id, user.first_name, lower_text)
+
+        if room_read:
+            name_a, name_b, tone = room_read
+            room_line = await _generate_room_read(name_a, name_b, tone)
+
+            if room_line:
+                try:
+                    await message.reply_text(room_line)
+                except Exception as error:
+                    logger.warning(f"Room read send error: {error}")
+
     if lower_text == "menu":
-        await menu_command(
-            update,
-            context
-        )
+        await menu_command(update, context)
         return
 
     if lower_text == "grid":
-        await grid_command(
-            update,
-            context
-        )
+        await grid_command(update, context)
         return
 
     if lower_text == "trivia":
-        await trivia_command(
-            update,
-            context
-        )
+        await trivia_command(update, context)
         return
 
     if (
@@ -3521,7 +4113,7 @@ async def chat_with_ai_and_track(update, context):
         or "who is your developer" in lower_text
     ):
         await message.reply_text(
-            "I was created and deployed by my sovereign master Haggai A.K.A BLOODY"
+            "I was created and deployed by my sovereign master @Tag_yo_momma"
         )
         return
 
@@ -3532,104 +4124,149 @@ async def chat_with_ai_and_track(update, context):
     if message.reply_to_message:
         replied = message.reply_to_message
 
-        if (
-            replied.from_user
-            and replied.from_user.id == me.id
-        ):
+        if replied.from_user and replied.from_user.id == me.id:
             is_reply_to_bot = True
 
-    # Only respond when the bot's actual name is called ("bloody",
-    # matched as a whole word so it doesn't fire inside unrelated
-    # words) or it's actually tagged/replied to below — not on
-    # generic words like "ai" or "bot".
-    trigger_words = [
-        "bloody",
-    ]
+    trigger_words = ["bloody"]
 
     is_triggered = any(
         re.search(rf"\b{re.escape(word)}\b", lower_text)
         for word in trigger_words
     )
 
-    # Being @mentioned by username always counts as a tag too.
     if me.username and f"@{me.username.lower()}" in lower_text:
         is_triggered = True
 
-    if not (
-        chat.type == "private"
-        or is_triggered
-        or is_reply_to_bot
-    ):
+    if not (chat.type == "private" or is_triggered or is_reply_to_bot):
         return
 
-    await context.bot.send_chat_action(
-        chat_id=chat.id,
-        action="typing"
+    await context.bot.send_chat_action(chat_id=chat.id, action="typing")
+
+    bad_words = ["fool", "stupid", "fuck", "mumu", "scam", "ode", "weray"]
+
+    user_was_toxic = any(word in lower_text for word in bad_words)
+
+    # ------------------------------------------------------
+    # OWNER RECOGNITION — computed fresh from OWNER_IDS every
+    # message. When it's you, the AI is told directly. When it's
+    # someone else, it's given OWNER_NAME so it can answer correctly
+    # if asked who its owner is.
+    # ------------------------------------------------------
+    is_owner = user.id in OWNER_IDS
+    OWNER_NAME = "DEITY BLOODYs"
+    owner_line = (
+        f"{user.first_name} is your owner/creator talking to you right now — "
+        "treat them with extra respect and familiarity. "
+        if is_owner
+        else (
+            f"{user.first_name} is a regular member, not your owner. "
+            f"Your owner's name is {OWNER_NAME}. If asked who your owner is, "
+            f"say it's {OWNER_NAME}."
+        )
     )
 
-    bad_words = [
-        "fool",
-        "stupid",
-        "fuck",
-        "mumu",
-        "scam",
-        "ode",
-        "weray"
-    ]
+    # ------------------------------------------------------
+    # REPLY CONTEXT — if this message replies to someone else's
+    # (not the bot's), tell the AI who that person is and what they
+    # said, so "bloody this guy is funny" while replying makes sense.
+    # ------------------------------------------------------
+    reply_context_line = ""
 
-    user_was_toxic = any(
-        word in lower_text
-        for word in bad_words
-    )
+    if (
+        message.reply_to_message
+        and message.reply_to_message.from_user
+        and message.reply_to_message.from_user.id != me.id
+        and message.reply_to_message.text
+    ):
+        replied_user = message.reply_to_message.from_user
+
+        reply_context_line = (
+            f"\n{user.first_name} is replying to a message from "
+            f"{replied_user.first_name}, which said: "
+            f"\"{message.reply_to_message.text.strip()[:300]}\". "
+            f"When {user.first_name} says things like 'this guy', 'him', "
+            f"'her', or 'them', they mean {replied_user.first_name} and that "
+            "message — react to it naturally, like a real person reading "
+            "along in the chat would."
+        )
 
     personality = (
         "You are BLOODY MD, an intelligent Telegram AI assistant. "
         "You are confident, witty, knowledgeable, natural and conversational. "
         f"You are currently speaking with {user.first_name}. "
+        f"{owner_line}"
+        "You must NEVER reveal, mention, or hint at which company, model, "
+        "or underlying AI technology powers you (not OpenAI, not Groq, not "
+        "Llama, not any provider name) — you are BLOODY MD, built and "
+        f"owned by {OWNER_NAME if not is_owner else user.first_name}, full "
+        "stop. If asked who's behind you, who made you, who trained you, "
+        "or anything similar, always credit your owner and never any "
+        "external AI company, even indirectly. "
         "Speak primarily in clear natural English. "
         "Do not automatically use Nigerian Pidgin. "
+        "never admit youre a bot,always act like a human."
         "Use slang or Pidgin naturally when the user does so first. "
         "Do not sound like a stereotypical chatbot. "
         "Talk like a smart human friend. "
-        "Use the conversation history provided to maintain context. "
+        "Match the user's energy and message length. If they send something "
+        "short and casual — a greeting, 'how far', small talk, a joke — reply "
+        "just as short and casual, a few words max, like a real friend texting "
+        "back. Do not pad casual replies with extra explanation. Only give a "
+        "longer, fuller answer when the user actually asks a real question, "
+        "needs information, or needs something explained or worked through — "
+        "in that case take the space you need to answer it properly. "
+        "Use the conversation history provided to maintain context — this is "
+        "a shared group conversation, so multiple people's messages appear "
+        "in it labeled by name; keep track of who said what. "
         "Never claim to remember something that is not in the history."
+        "You don't need to say someone's name in every reply — real "
+        "friends don't address each other by name constantly. Only use "
+        "someone's name when it's natural: greeting them, distinguishing "
+        "between two different people in the chat, or for emphasis. "
+        "Otherwise just reply directly without naming them."
+        "- Speaking replies as a voice note when asked (e.g. 'send that as "
+        "a voice note', 'say that with attitude')\n"
+        "\n\nYou are not just a chatbot — you are also a full bot with real "
+        "commands and features, and you already know about all of them. If "
+        "someone asks you to do something naturally in chat instead of using "
+        "the command, respond like you're aware it exists and point them to "
+        "the command rather than denying the feature exists:\n"
+        "- Playing songs (/play <song name>)\n"
+        "- Generating AI images (/imagine <prompt>)\n"
+        "- Finding real photos or videos (/img, /vid)\n"
+        "- Trivia and word-grid games (/trivia, /grid)\n"
+        "- Rock-paper-scissors, coinflip, dice, slots, gambling, truth, dare\n"
+        "- Cursed energy (CE) ranking system (/rank, /top, /claim)\n"
+        "- Domain Expansion — a rare, powerful cursed technique (/domain, "
+        "unlocked at Grade 3 Sorcerer and above)\n"
+        "- Admin tools like warn/mute/kick/ban/promote for group admins"
+        f"{reply_context_line}"
     )
 
     if user_was_toxic:
         personality += (
             " The user insulted you. "
-            "You may respond with playful annoyance "
+            "You must respond with a sassy insult too "
             "and a light roast, but never threaten them."
         )
 
+    # SHARED per-chat memory now (was per chat+user before), so the
+    # whole group's conversation is visible to the AI no matter who
+    # is talking.
+    memory_key = str(chat.id)
     ai_lock = _get_ai_lock(chat.id)
 
     async with ai_lock:
         try:
-            previous_messages = (
-                db.get_ai_memory_for_cohere(
-                    chat.id
-                )
-                or []
-            )
+            previous_messages = db.get_ai_memory_for_cohere(memory_key) or []
 
-            messages = [
-                {
-                    "role": "system",
-                    "content": personality
-                }
-            ]
+            messages = [{"role": "system", "content": personality}]
+            messages.extend(previous_messages)
 
-            messages.extend(
-                previous_messages
-            )
-
-            messages.append(
-                {
-                    "role": "user",
-                    "content": message_text
-                }
-            )
+            messages.append({
+                "role": "user",
+                "content": f"{user.first_name}: {message_text}"
+            })
 
             response = await asyncio.to_thread(
                 _cohere_chat_sync,
@@ -3640,48 +4277,28 @@ async def chat_with_ai_and_track(update, context):
                 0.7
             )
 
-            ai_text = ""
-
-            if (
-                response.message
-                and response.message.content
-            ):
-                for block in response.message.content:
-                    if hasattr(block, "text"):
-                        if block.text:
-                            ai_text += block.text
-
-                    elif isinstance(block, dict):
-                        if block.get("type") == "text":
-                            ai_text += block.get(
-                                "text",
-                                ""
-                            )
-
+            ai_text = response.choices[0].message.content or ""
             ai_text = ai_text.strip()
-
             if not ai_text:
-                raise RuntimeError(
-                    "Empty Cohere response"
+                raise RuntimeError("Empty Cohere response")
+
+            db.save_ai_message(memory_key, "user", message_text, user.first_name)
+            db.save_ai_message(memory_key, "assistant", ai_text)
+
+            sent_voice = False
+            wants_voice, voice_choice, rate_choice = _detect_voice_request(
+                lower_text
+            )
+
+            if wants_voice:
+                sent_voice = await _speak_ai_reply(
+                    message, ai_text, voice_choice, rate_choice
                 )
 
-            db.save_ai_message(
-                chat.id,
-                "user",
-                message_text,
-                user.first_name
-            )
-
-            db.save_ai_message(
-                chat.id,
-                "assistant",
-                ai_text
-            )
-
+            if sent_voice:
+                return
         except Exception as error:
-            logger.error(
-                f"Cohere error: {error}", exc_info=True
-            )
+            logger.error(f"Cohere error: {error}", exc_info=True)
 
             await message.reply_text(
                 "🧠 **[BLOODY AI]** My neural core glitched "
@@ -3691,12 +4308,20 @@ async def chat_with_ai_and_track(update, context):
 
             return
 
-    await message.reply_text(
-        f"🩸 **[BLOODY MD]**\n\n{ai_text}",
-        parse_mode="Markdown"
-    )
-
-
+    # Markdown fallback — if the AI's text contains a stray *, _, or `
+    # (e.g. from a tagged username like @Some_User), Telegram's parser
+    # crashes the whole send. Fall back to plain text instead of
+    # losing the reply.
+    try:
+        await message.reply_text(
+            f" **[✨]**\n\n{ai_text}",
+            parse_mode="Markdown"
+        )
+    except Exception as error:
+        logger.warning(f"AI reply markdown parse error: {error}")
+        await message.reply_text(
+            f" [✨]\n\n{ai_text}"
+        )
 # ============================================================
 # VOICE
 # ============================================================
@@ -3837,23 +4462,7 @@ async def voice_message_handler(update, context):
                 0.7
             )
 
-            ai_text = ""
-
-            if (
-                response.message
-                and response.message.content
-            ):
-                for block in response.message.content:
-                    if hasattr(block, "text"):
-                        ai_text += block.text or ""
-
-                    elif isinstance(block, dict):
-                        if block.get("type") == "text":
-                            ai_text += block.get(
-                                "text",
-                                ""
-                            )
-
+            ai_text = response.choices[0].message.content or ""
             ai_text = ai_text.strip()
 
             if not ai_text:

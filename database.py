@@ -26,6 +26,7 @@ DB_FILE = "bot_data.json"
 # ============================================================
 
 MAX_AI_MEMORY = 20
+AI_MEMORY_MAX_AGE_SECONDS = 15 * 60  # messages older than this are ignored
 
 _LOCK = threading.RLock()
 _WRITER = ThreadPoolExecutor(max_workers=1)
@@ -297,22 +298,124 @@ def are_games_enabled(chat_id):
 # XP SYSTEM
 # ============================================================
 
-def get_tier(xp):
-    if xp < 500:
-        return "Rookie"
-    elif xp < 2000:
-        return "Veteran"
-    elif xp < 7000:
-        return "Elite Warrior"
-    elif xp < 15000:
-        return "Bloody Commander"
-    elif xp < 35000:
-        return "Grandmaster"
-    else:
-        return "👑 Supreme Sovereign"
+# ------------------------------------------------------------
+# SORCERER GRADE LADDER
+#
+# The "xp" key in the database is now displayed everywhere as
+# CE (Cursed Energy). The key name itself is left as "xp" on
+# purpose so every existing balance in bot_data.json keeps
+# working — only what the user SEES changed.
+#
+# Each grade is roughly double the last, so early grades come
+# fast and Special Grade stays rare.
+# ------------------------------------------------------------
+
+GRADES = [
+    (0,      "⚪", "Grade 4 Sorcerer"),
+    (1000,    "🟢", "Grade 3 Sorcerer"),
+    (10000,    "🟡", "Semi-Grade 2 Sorcerer"),
+    (50000,   "🟠", "Grade 2 Sorcerer"),
+    (100000,  "🔵", "Semi-Grade 1 Sorcerer"),
+    (200000,  "🔴", "Grade 1 Sorcerer"),
+    (300000, "🟣", "Special Grade Sorcerer"),
+]
+DOMAIN_NAMES = [
+    None,                # Grade 4 — no domain yet
+    "Withering Veil",
+    "Hollow Requiem",
+    "Fractured Abyss",
+    "Silent Judgment",
+    "Obsidian Throne",
+    None,                # Special Grade — player-chosen, not fixed
+]
+
+BLOODY_DOMAIN_NAME = "The Unwritten Chapter"
 
 
-def update_user_activity(user_id, username, first_name, chat_id):
+def get_grade_index(ce):
+    """Returns the index into GRADES/DOMAIN_NAMES matching this CE
+    amount — 0 is Grade 4, 6 is Special Grade."""
+
+    index = 0
+
+    for i, (threshold, _, _) in enumerate(GRADES):
+        if ce >= threshold:
+            index = i
+        else:
+            break
+
+    return index
+
+
+def set_user_domain_name(user_id, name):
+    with _LOCK:
+        db = _ensure_loaded()
+        u_id = str(user_id)
+
+        if u_id not in db["users"]:
+            return False
+
+        db["users"][u_id]["domain_name"] = name
+
+    _schedule_save()
+    return True
+
+
+def get_user_domain_name(user_id):
+    with _LOCK:
+        db = _ensure_loaded()
+        u_id = str(user_id)
+        return db["users"].get(u_id, {}).get("domain_name")
+
+
+def get_grade(ce):
+    """Returns (emoji, name) for the grade this CE amount sits in."""
+
+    emoji, name = GRADES[0][1], GRADES[0][2]
+
+    for threshold, grade_emoji, grade_name in GRADES:
+        if ce >= threshold:
+            emoji, name = grade_emoji, grade_name
+        else:
+            break
+
+    return emoji, name
+
+
+def get_next_grade(ce):
+    """Returns (threshold, emoji, name) for the NEXT grade up, or
+    None if the user is already Special Grade."""
+
+    for threshold, grade_emoji, grade_name in GRADES:
+        if ce < threshold:
+            return threshold, grade_emoji, grade_name
+
+    return None
+
+
+def get_grade_floor(ce):
+    """CE amount at which the user's CURRENT grade started."""
+
+    floor = GRADES[0][0]
+
+    for threshold, _, _ in GRADES:
+        if ce >= threshold:
+            floor = threshold
+        else:
+            break
+
+    return floor
+
+
+def get_tier(ce):
+    """Kept under its old name so existing calls (e.g. /top) keep
+    working — it now returns the grade instead of the old tier."""
+
+    emoji, name = get_grade(ce)
+    return f"{emoji} {name}"
+
+
+def update_user_activity(user_id, username, first_name, chat_id, xp_multiplier=1.0):
     with _LOCK:
         db = _ensure_loaded()
 
@@ -336,7 +439,7 @@ def update_user_activity(user_id, username, first_name, chat_id):
                 "losses": 0
             }
 
-        random_xp = random.randint(3, 15)
+        random_xp = max(1, int(random.randint(3, 15) * xp_multiplier))
 
         db["users"][u_id]["xp"] += random_xp
         db["users"][u_id]["global_messages"] += 1
@@ -697,7 +800,11 @@ def save_ai_message(chat_id, role, content, user_name=None):
         if chat_id not in db["ai_memory"]:
             db["ai_memory"][chat_id] = []
 
-        message = {"role": role, "content": content}
+        message = {
+            "role": role,
+            "content": content,
+            "timestamp": datetime.now().timestamp(),
+        }
 
         if user_name:
             message["user_name"] = user_name
@@ -719,9 +826,18 @@ def clear_ai_memory(chat_id):
 def get_ai_memory_for_cohere(chat_id):
     history = get_ai_memory(chat_id)
 
+    cutoff = datetime.now().timestamp() - AI_MEMORY_MAX_AGE_SECONDS
+
     messages = []
 
     for item in history:
+        timestamp = item.get("timestamp")
+
+        # Messages saved before this update have no timestamp — let
+        # them through once, they'll age out naturally after that.
+        if timestamp is not None and timestamp < cutoff:
+            continue
+
         role = item.get("role")
         content = item.get("content", "")
         user_name = item.get("user_name")
@@ -732,7 +848,6 @@ def get_ai_memory_for_cohere(chat_id):
         messages.append({"role": role, "content": content})
 
     return messages
-
 
 # ============================================================
 # COOLDOWNS

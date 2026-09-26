@@ -209,6 +209,7 @@ def main():
     # --------------------------------------------------------
     app.add_handler(CommandHandler("menu", h.menu_command))
     app.add_handler(CommandHandler("rank", h.rank_command))
+    app.add_handler(CommandHandler("grade", h.grade_list_command))
     app.add_handler(CommandHandler("top", h.top_command))
     app.add_handler(CommandHandler("claim", h.claim_command))
     app.add_handler(CommandHandler("recognize", h.recognize_command))
@@ -234,6 +235,7 @@ def main():
     # --------------------------------------------------------
     app.add_handler(CommandHandler("trivia", h.trivia_command))
     app.add_handler(CallbackQueryHandler(h.trivia_callback, pattern="^trivia_"))
+    app.add_handler(CallbackQueryHandler(h.duel_response_callback, pattern=r"^duel_"))
     app.add_handler(CommandHandler("grid", h.grid_command))
     app.add_handler(CommandHandler("rps", h.rps_command))
     app.add_handler(CommandHandler("coinflip", h.coinflip_command))
@@ -244,6 +246,8 @@ def main():
     app.add_handler(CommandHandler("gamble", h.gamble_command))
     app.add_handler(CommandHandler("steal", h.steal_command))
     app.add_handler(CommandHandler("duel", h.duel_command))
+    app.add_handler(CommandHandler("domain", h.domain_command))
+    app.add_handler(CommandHandler("setdomain", h.setdomain_command))
     app.add_handler(CommandHandler("gridboard", h.gridboard_command))
     app.add_handler(CallbackQueryHandler(h.gridboard_callback, pattern="^gridboard_"))
     # NOTE: upgraded_features.py also defines its own rps/coinflip/
@@ -261,7 +265,7 @@ def main():
     app.add_handler(CommandHandler("demote", h.demote_command))
     app.add_handler(CommandHandler("antispam", h.antispam_command))
     app.add_handler(CommandHandler("poll", h.poll_command))
-    app.add_handler(CommandHandler("givexp", h.givexp_command))
+    app.add_handler(CommandHandler("givece", h.givexp_command))
     app.add_handler(CommandHandler("warn", h.warn_command))
     app.add_handler(CommandHandler("warnings", h.warnings_command))
     app.add_handler(CommandHandler("clearwarns", h.clearwarns_command))

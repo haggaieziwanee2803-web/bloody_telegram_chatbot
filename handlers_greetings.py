@@ -31,19 +31,22 @@ GREETING_CHAT_IDS = [
 ]
 
 MORNING_MESSAGES = [
-    "☀️ **GOOD MORNING FAM!** 🩸\n\nRise and grind — a new day, a new chance to top the leaderboard. Let's get it!",
-    "🌅 **Morning, Bloody Family!**\n\nCoffee in one hand, ambition in the other. Let's make today count. ☕🔥",
-]
+        "🌅 The domain awakens. Rise, sorcerers — another day to sharpen your cursed technique.",
+       
+       
+    ],
 
-AFTERNOON_MESSAGES = [
-    "🌤️ **Good afternoon, everyone!**\n\nHow's the day treating you? Take a break, run `/trivia`, and grab some free XP. 🧠",
-    "🕑 **Afternoon check-in!** 🩸\n\nHope you're crushing it today. Don't forget to `/claim` your daily XP if you haven't!",
-]
+AFTERNOON_MESSAGES =[
+        
+        "☀️ The domain is buzzing. How's your cursed energy looking today? Run /rank and find out.",
+        
+    ],
 
 NIGHT_MESSAGES = [
-    "🌙 **Good night, Bloody Family!** 🩸\n\nRest up — tomorrow's another day to climb the ranks. See you at the top. 🌌",
-    "🌃 **Winding down for the night?**\n\nGreat day, everyone. Sleep well and come back stronger tomorrow. 💤🩸",
-]
+       
+       
+        "🌙 Good night, sorcerers. Log your progress with /rank before you go dark.",
+    ],
 
 
 # ============================================================

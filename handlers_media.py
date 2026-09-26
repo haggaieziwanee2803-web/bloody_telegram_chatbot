@@ -13,6 +13,7 @@
 import os
 import random
 import urllib.parse
+import re
 
 import aiohttp
 
@@ -35,7 +36,73 @@ async def get_session():
     if _SESSION is None or _SESSION.closed:
         _SESSION = aiohttp.ClientSession()
     return _SESSION
+async def _get_ddg_vqd(session, query):
+    """DuckDuckGo's image search needs a short-lived token (vqd) that's
+    embedded in their regular search page HTML before you can call the
+    actual image endpoint. This fetches that token."""
 
+    url = "https://duckduckgo.com/"
+    params = {"q": query}
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    async with session.get(
+        url, params=params, headers=headers,
+        timeout=aiohttp.ClientTimeout(total=15)
+    ) as resp:
+        text = await resp.text()
+
+    match = re.search(r"vqd=['\"]?([\d-]+)['\"]?", text)
+
+    if not match:
+        return None
+
+    return match.group(1)
+
+
+async def _search_duckduckgo_image(query):
+    """Searches DuckDuckGo's image results directly — no API key, and
+    covers basically anything DuckDuckGo has indexed, not just stock
+    photography. Unofficial endpoint, so it's wrapped defensively and
+    callers should have a fallback ready."""
+
+    session = await get_session()
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    try:
+        vqd = await _get_ddg_vqd(session, query)
+
+        if not vqd:
+            return None
+
+        url = "https://duckduckgo.com/i.js"
+        params = {
+            "q": query,
+            "o": "json",
+            "vqd": vqd,
+            "f": ",,,",
+            "p": "1",
+        }
+
+        async with session.get(
+            url, params=params, headers=headers,
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as resp:
+            if resp.status != 200:
+                return None
+
+            data = await resp.json(content_type=None)
+
+        results = data.get("results", [])
+
+        if not results:
+            return None
+
+        chosen = random.choice(results[:20])
+        return chosen.get("image")
+
+    except Exception as error:
+        print(f"DuckDuckGo image search error: {error}")
+        return None
 
 # ============================================================
 # /imagine — AI image generation (Pollinations.ai, free, no API key)
@@ -66,7 +133,7 @@ async def imagine_command(update, context):
         seed = random.randint(1, 999999)
         url = (
             f"https://image.pollinations.ai/prompt/{encoded_prompt}"
-            f"?width=1024&height=1024&seed={seed}&nologo=true"
+            f"?width=1024&height=1024&seed={seed}&nologo=true&model=flux"
         )
 
         session = await get_session()
@@ -138,9 +205,16 @@ async def img_command(update, context):
 
 
 async def _search_photo(query):
+    # Try DuckDuckGo first — broadest coverage, not limited to stock
+    # photography, and needs no API key.
+    ddg_result = await _search_duckduckgo_image(query)
+
+    if ddg_result:
+        return ddg_result
+
     session = await get_session()
 
-    # Try Pexels first
+    # Fall back to Pexels
     if PEXELS_API_KEY:
         url = f"https://api.pexels.com/v1/search?query={urllib.parse.quote(query)}&per_page=10"
         headers = {"Authorization": PEXELS_API_KEY}
@@ -153,7 +227,7 @@ async def _search_photo(query):
                     chosen = random.choice(photos)
                     return chosen["src"]["large"]
 
-    # Fall back to Pixabay
+    # Final fallback: Pixabay
     if PIXABAY_API_KEY:
         url = (
             f"https://pixabay.com/api/?key={PIXABAY_API_KEY}"
@@ -169,8 +243,6 @@ async def _search_photo(query):
                     return chosen["largeImageURL"]
 
     return None
-
-
 # ============================================================
 # /vid — search + download a real video matching a description
 # ============================================================
